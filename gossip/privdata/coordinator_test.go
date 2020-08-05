@@ -11,11 +11,20 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io/ioutil"
+	"os"
 	"reflect"
 	"testing"
 	"time"
 
 	pb "github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric-protos-go/common"
+	proto "github.com/hyperledger/fabric-protos-go/gossip"
+	"github.com/hyperledger/fabric-protos-go/ledger/rwset"
+	"github.com/hyperledger/fabric-protos-go/ledger/rwset/kvrwset"
+	mspproto "github.com/hyperledger/fabric-protos-go/msp"
+	"github.com/hyperledger/fabric-protos-go/peer"
+	tspb "github.com/hyperledger/fabric-protos-go/transientstore"
 	"github.com/hyperledger/fabric/bccsp/factory"
 	"github.com/hyperledger/fabric/common/metrics/disabled"
 	util2 "github.com/hyperledger/fabric/common/util"
@@ -27,181 +36,37 @@ import (
 	gmetricsmocks "github.com/hyperledger/fabric/gossip/metrics/mocks"
 	privdatacommon "github.com/hyperledger/fabric/gossip/privdata/common"
 	"github.com/hyperledger/fabric/gossip/privdata/mocks"
+	capabilitymock "github.com/hyperledger/fabric/gossip/privdata/mocks"
 	"github.com/hyperledger/fabric/gossip/util"
-	"github.com/hyperledger/fabric/protos/common"
-	proto "github.com/hyperledger/fabric/protos/gossip"
-	"github.com/hyperledger/fabric/protos/ledger/rwset"
-	"github.com/hyperledger/fabric/protos/ledger/rwset/kvrwset"
-	"github.com/hyperledger/fabric/protos/msp"
-	"github.com/hyperledger/fabric/protos/peer"
-	transientstore2 "github.com/hyperledger/fabric/protos/transientstore"
+	"github.com/hyperledger/fabric/msp"
+	"github.com/hyperledger/fabric/msp/mgmt"
+	mspmgmt "github.com/hyperledger/fabric/msp/mgmt"
+	msptesttools "github.com/hyperledger/fabric/msp/mgmt/testtools"
 	"github.com/hyperledger/fabric/protoutil"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
-func init() {
-	factory.InitFactories(nil)
-}
-
 var testConfig = CoordinatorConfig{
-	PullRetryThreshold:      time.Second * 3,
-	TransientBlockRetention: 1000,
+	PullRetryThreshold:             time.Second * 3,
+	TransientBlockRetention:        1000,
+	SkipPullingInvalidTransactions: false,
 }
 
 // CollectionCriteria aggregates criteria of
 // a collection
 type CollectionCriteria struct {
 	Channel    string
-	TxId       string
 	Collection string
 	Namespace  string
 }
 
-func fromCollectionCriteria(criteria common.CollectionCriteria) CollectionCriteria {
+func fromCollectionCriteria(criteria privdata.CollectionCriteria) CollectionCriteria {
 	return CollectionCriteria{
-		TxId:       criteria.TxId,
 		Collection: criteria.Collection,
 		Namespace:  criteria.Namespace,
 		Channel:    criteria.Channel,
 	}
-}
-
-type persistCall struct {
-	*mock.Call
-	store *mockTransientStore
-}
-
-func (pc *persistCall) expectRWSet(namespace string, collection string, rws []byte) *persistCall {
-	if pc.store.persists == nil {
-		pc.store.persists = make(map[rwsTriplet]struct{})
-	}
-	pc.store.persists[rwsTriplet{
-		namespace:  namespace,
-		collection: collection,
-		rwset:      hex.EncodeToString(rws),
-	}] = struct{}{}
-	return pc
-}
-
-type mockTransientStore struct {
-	t *testing.T
-	mock.Mock
-	persists      map[rwsTriplet]struct{}
-	lastReqTxID   string
-	lastReqFilter map[string]ledger.PvtCollFilter
-}
-
-func (store *mockTransientStore) On(methodName string, arguments ...interface{}) *persistCall {
-	return &persistCall{
-		store: store,
-		Call:  store.Mock.On(methodName, arguments...),
-	}
-}
-
-func (store *mockTransientStore) PurgeByTxids(txids []string) error {
-	args := store.Called(txids)
-	return args.Error(0)
-}
-
-func (store *mockTransientStore) Persist(txid string, blockHeight uint64, res *rwset.TxPvtReadWriteSet) error {
-	key := rwsTriplet{
-		namespace:  res.NsPvtRwset[0].Namespace,
-		collection: res.NsPvtRwset[0].CollectionPvtRwset[0].CollectionName,
-		rwset:      hex.EncodeToString(res.NsPvtRwset[0].CollectionPvtRwset[0].Rwset)}
-	if _, exists := store.persists[key]; !exists {
-		store.t.Fatal("Shouldn't have persisted", res)
-	}
-	delete(store.persists, key)
-	store.Called(txid, blockHeight, res)
-	return nil
-}
-
-func (store *mockTransientStore) PersistWithConfig(txid string, blockHeight uint64, privateSimulationResultsWithConfig *transientstore2.TxPvtReadWriteSetWithConfigInfo) error {
-	res := privateSimulationResultsWithConfig.PvtRwset
-	key := rwsTriplet{
-		namespace:  res.NsPvtRwset[0].Namespace,
-		collection: res.NsPvtRwset[0].CollectionPvtRwset[0].CollectionName,
-		rwset:      hex.EncodeToString(res.NsPvtRwset[0].CollectionPvtRwset[0].Rwset)}
-	if _, exists := store.persists[key]; !exists {
-		store.t.Fatal("Shouldn't have persisted", res)
-	}
-	delete(store.persists, key)
-	store.Called(txid, blockHeight, privateSimulationResultsWithConfig)
-	return nil
-}
-
-func (store *mockTransientStore) PurgeByHeight(maxBlockNumToRetain uint64) error {
-	return store.Called(maxBlockNumToRetain).Error(0)
-}
-
-func (store *mockTransientStore) GetTxPvtRWSetByTxid(txid string, filter ledger.PvtNsCollFilter) (transientstore.RWSetScanner, error) {
-	store.lastReqTxID = txid
-	store.lastReqFilter = filter
-	args := store.Called(txid, filter)
-	if args.Get(1) == nil {
-		return args.Get(0).(transientstore.RWSetScanner), nil
-	}
-	return nil, args.Get(1).(error)
-}
-
-type mockRWSetScanner struct {
-	err     error
-	results []*transientstore.EndorserPvtSimulationResultsWithConfig
-}
-
-func (scanner *mockRWSetScanner) withRWSet(ns string, col string) *mockRWSetScanner {
-	scanner.results = append(scanner.results, &transientstore.EndorserPvtSimulationResultsWithConfig{
-		PvtSimulationResultsWithConfig: &transientstore2.TxPvtReadWriteSetWithConfigInfo{
-			PvtRwset: &rwset.TxPvtReadWriteSet{
-				DataModel: rwset.TxReadWriteSet_KV,
-				NsPvtRwset: []*rwset.NsPvtReadWriteSet{
-					{
-						Namespace: ns,
-						CollectionPvtRwset: []*rwset.CollectionPvtReadWriteSet{
-							{
-								CollectionName: col,
-								Rwset:          []byte("rws-pre-image"),
-							},
-						},
-					},
-				},
-			},
-			CollectionConfigs: map[string]*common.CollectionConfigPackage{
-				ns: {
-					Config: []*common.CollectionConfig{
-						{
-							Payload: &common.CollectionConfig_StaticCollectionConfig{
-								StaticCollectionConfig: &common.StaticCollectionConfig{
-									Name: col,
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-	})
-	return scanner
-}
-
-func (scanner *mockRWSetScanner) Next() (*transientstore.EndorserPvtSimulationResults, error) {
-	panic("should not be used")
-}
-
-func (scanner *mockRWSetScanner) NextWithConfig() (*transientstore.EndorserPvtSimulationResultsWithConfig, error) {
-	if scanner.err != nil {
-		return nil, scanner.err
-	}
-	var res *transientstore.EndorserPvtSimulationResultsWithConfig
-	if len(scanner.results) == 0 {
-		return nil, nil
-	}
-	res, scanner.results = scanner.results[len(scanner.results)-1], scanner.results[:len(scanner.results)-1]
-	return res, nil
-}
-
-func (*mockRWSetScanner) Close() {
 }
 
 type validatorMock struct {
@@ -238,7 +103,7 @@ func (fc *fetchCall) expectingEndorsers(orgs ...string) *fetchCall {
 		fc.fetcher.expectedEndorsers = make(map[string]struct{})
 	}
 	for _, org := range orgs {
-		sID := &msp.SerializedIdentity{Mspid: org, IdBytes: []byte(fmt.Sprintf("p0%s", org))}
+		sID := &mspproto.SerializedIdentity{Mspid: org, IdBytes: []byte(fmt.Sprintf("p0%s", org))}
 		b, _ := pb.Marshal(sID)
 		fc.fetcher.expectedEndorsers[string(b)] = struct{}{}
 	}
@@ -271,23 +136,64 @@ func (f *fetcherMock) On(methodName string, arguments ...interface{}) *fetchCall
 }
 
 func (f *fetcherMock) fetch(dig2src dig2sources) (*privdatacommon.FetchedPvtDataContainer, error) {
+	uniqueEndorsements := make(map[string]interface{})
 	for _, endorsements := range dig2src {
 		for _, endorsement := range endorsements {
 			_, exists := f.expectedEndorsers[string(endorsement.Endorser)]
 			if !exists {
 				f.t.Fatalf("Encountered a non-expected endorser: %s", string(endorsement.Endorser))
 			}
-			// Else, it exists, so delete it so we will end up with an empty expected map at the end of the call
-			delete(f.expectedEndorsers, string(endorsement.Endorser))
+			uniqueEndorsements[string(endorsement.Endorser)] = struct{}{}
 		}
 	}
-	assert.True(f.t, digests(dig2src.keys()).Equal(digests(f.expectedDigests)))
-	assert.Empty(f.t, f.expectedEndorsers)
+	require.True(f.t, digests(f.expectedDigests).Equal(digests(dig2src.keys())))
+	require.Equal(f.t, len(f.expectedEndorsers), len(uniqueEndorsements))
 	args := f.Called(dig2src)
 	if args.Get(1) == nil {
 		return args.Get(0).(*privdatacommon.FetchedPvtDataContainer), nil
 	}
 	return nil, args.Get(1).(error)
+}
+
+type testTransientStore struct {
+	storeProvider transientstore.StoreProvider
+	store         *transientstore.Store
+	tempdir       string
+}
+
+func newTransientStore(t *testing.T) *testTransientStore {
+	s := &testTransientStore{}
+	var err error
+	s.tempdir, err = ioutil.TempDir("", "ts")
+	if err != nil {
+		t.Fatalf("Failed to create test directory, got err %s", err)
+		return s
+	}
+	s.storeProvider, err = transientstore.NewStoreProvider(s.tempdir)
+	if err != nil {
+		t.Fatalf("Failed to open store, got err %s", err)
+		return s
+	}
+	s.store, err = s.storeProvider.OpenStore("testchannelid")
+	if err != nil {
+		t.Fatalf("Failed to open store, got err %s", err)
+		return s
+	}
+	return s
+}
+
+func (s *testTransientStore) tearDown() {
+	s.storeProvider.Close()
+	os.RemoveAll(s.tempdir)
+}
+
+func (s *testTransientStore) Persist(txid string, blockHeight uint64,
+	privateSimulationResultsWithConfig *tspb.TxPvtReadWriteSetWithConfigInfo) error {
+	return s.store.Persist(txid, blockHeight, privateSimulationResultsWithConfig)
+}
+
+func (s *testTransientStore) GetTxPvtRWSetByTxid(txid string, filter ledger.PvtNsCollFilter) (RWSetScanner, error) {
+	return s.store.GetTxPvtRWSetByTxid(txid, filter)
 }
 
 func createcollectionStore(expectedSignedData protoutil.SignedData) *collectionStore {
@@ -303,6 +209,7 @@ type collectionStore struct {
 	acceptsAll         bool
 	acceptsNone        bool
 	lenient            bool
+	mspIdentifier      string
 	store              map[CollectionCriteria]collectionAccessPolicy
 	policies           map[collectionAccessPolicy]CollectionCriteria
 }
@@ -327,7 +234,12 @@ func (cs *collectionStore) thatAccepts(cc CollectionCriteria) *collectionStore {
 	return cs
 }
 
-func (cs *collectionStore) RetrieveCollectionAccessPolicy(cc common.CollectionCriteria) (privdata.CollectionAccessPolicy, error) {
+func (cs *collectionStore) withMSPIdentity(identifier string) *collectionStore {
+	cs.mspIdentifier = identifier
+	return cs
+}
+
+func (cs *collectionStore) RetrieveCollectionAccessPolicy(cc privdata.CollectionCriteria) (privdata.CollectionAccessPolicy, error) {
 	if sp, exists := cs.store[fromCollectionCriteria(cc)]; exists {
 		return &sp, nil
 	}
@@ -340,20 +252,51 @@ func (cs *collectionStore) RetrieveCollectionAccessPolicy(cc common.CollectionCr
 	return nil, privdata.NoSuchCollectionError{}
 }
 
-func (cs *collectionStore) RetrieveCollection(common.CollectionCriteria) (privdata.Collection, error) {
+func (cs *collectionStore) RetrieveCollection(privdata.CollectionCriteria) (privdata.Collection, error) {
 	panic("implement me")
 }
 
-func (cs *collectionStore) RetrieveReadWritePermission(cc common.CollectionCriteria, sp *peer.SignedProposal, qe ledger.QueryExecutor) (bool, bool, error) {
+func (cs *collectionStore) RetrieveCollectionConfig(cc privdata.CollectionCriteria) (*peer.StaticCollectionConfig, error) {
+	mspIdentifier := "different-org"
+	if _, exists := cs.store[fromCollectionCriteria(cc)]; exists || cs.acceptsAll {
+		mspIdentifier = cs.mspIdentifier
+	}
+	return &peer.StaticCollectionConfig{
+		Name:           cc.Collection,
+		MemberOnlyRead: true,
+		MemberOrgsPolicy: &peer.CollectionPolicyConfig{
+			Payload: &peer.CollectionPolicyConfig_SignaturePolicy{
+				SignaturePolicy: &common.SignaturePolicyEnvelope{
+					Rule: &common.SignaturePolicy{
+						Type: &common.SignaturePolicy_SignedBy{
+							SignedBy: 0,
+						},
+					},
+					Identities: []*mspproto.MSPPrincipal{
+						{
+							PrincipalClassification: mspproto.MSPPrincipal_ROLE,
+							Principal: protoutil.MarshalOrPanic(&mspproto.MSPRole{
+								MspIdentifier: mspIdentifier,
+								Role:          mspproto.MSPRole_MEMBER,
+							}),
+						},
+					},
+				},
+			},
+		},
+	}, nil
+}
+
+func (cs *collectionStore) RetrieveReadWritePermission(cc privdata.CollectionCriteria, sp *peer.SignedProposal, qe ledger.QueryExecutor) (bool, bool, error) {
 	panic("implement me")
 }
 
-func (cs *collectionStore) RetrieveCollectionConfigPackage(cc common.CollectionCriteria) (*common.CollectionConfigPackage, error) {
-	return &common.CollectionConfigPackage{
-		Config: []*common.CollectionConfig{
+func (cs *collectionStore) RetrieveCollectionConfigPackage(cc privdata.CollectionCriteria) (*peer.CollectionConfigPackage, error) {
+	return &peer.CollectionConfigPackage{
+		Config: []*peer.CollectionConfig{
 			{
-				Payload: &common.CollectionConfig_StaticCollectionConfig{
-					StaticCollectionConfig: &common.StaticCollectionConfig{
+				Payload: &peer.CollectionConfig_StaticCollectionConfig{
+					StaticCollectionConfig: &peer.StaticCollectionConfig{
 						Name:              cc.Collection,
 						MaximumPeerCount:  1,
 						RequiredPeerCount: 1,
@@ -364,11 +307,11 @@ func (cs *collectionStore) RetrieveCollectionConfigPackage(cc common.CollectionC
 	}, nil
 }
 
-func (cs *collectionStore) RetrieveCollectionPersistenceConfigs(cc common.CollectionCriteria) (privdata.CollectionPersistenceConfigs, error) {
+func (cs *collectionStore) RetrieveCollectionPersistenceConfigs(cc privdata.CollectionCriteria) (privdata.CollectionPersistenceConfigs, error) {
 	panic("implement me")
 }
 
-func (cs *collectionStore) AccessFilter(channelName string, collectionPolicyConfig *common.CollectionPolicyConfig) (privdata.Filter, error) {
+func (cs *collectionStore) AccessFilter(channelName string, collectionPolicyConfig *peer.CollectionPolicyConfig) (privdata.Filter, error) {
 	panic("implement me")
 }
 
@@ -377,8 +320,11 @@ type collectionAccessPolicy struct {
 	n  uint64
 }
 
-func (cap *collectionAccessPolicy) MemberOrgs() []string {
-	return []string{"org0", "org1"}
+func (cap *collectionAccessPolicy) MemberOrgs() map[string]struct{} {
+	return map[string]struct{}{
+		"org0": {},
+		"org1": {},
+	}
 }
 
 func (cap *collectionAccessPolicy) RequiredPeerCount() int {
@@ -440,7 +386,7 @@ func TestPvtDataCollections_FailOnEmptyPayload(t *testing.T) {
 	}
 
 	_, err := collection.Marshal()
-	assertion := assert.New(t)
+	assertion := require.New(t)
 	assertion.Error(err, "Expected to fail since second item has nil payload")
 	assertion.Equal("Mallformed private data payload, rwset index 1 is nil", fmt.Sprintf("%s", err))
 }
@@ -454,7 +400,7 @@ func TestPvtDataCollections_FailMarshalingWriteSet(t *testing.T) {
 	}
 
 	_, err := collection.Marshal()
-	assertion := assert.New(t)
+	assertion := require.New(t)
 	assertion.Error(err, "Expected to fail since first item has nil writeset")
 	assertion.Contains(fmt.Sprintf("%s", err), "Could not marshal private rwset index 0")
 }
@@ -509,7 +455,7 @@ func TestPvtDataCollections_Marshal(t *testing.T) {
 
 	bytes, err := collection.Marshal()
 
-	assertion := assert.New(t)
+	assertion := require.New(t)
 	assertion.NoError(err)
 	assertion.NotNil(bytes)
 	assertion.Equal(2, len(bytes))
@@ -538,7 +484,7 @@ func TestPvtDataCollections_Unmarshal(t *testing.T) {
 
 	bytes, err := collection.Marshal()
 
-	assertion := assert.New(t)
+	assertion := require.New(t)
 	assertion.NoError(err)
 	assertion.NotNil(bytes)
 	assertion.Equal(1, len(bytes))
@@ -631,131 +577,307 @@ var expectedCommittedPrivateData2 = map[uint64]*ledger.TxPvtData{
 var expectedCommittedPrivateData3 = map[uint64]*ledger.TxPvtData{}
 
 func TestCoordinatorStoreInvalidBlock(t *testing.T) {
+	err := msptesttools.LoadMSPSetupForTesting()
+	require.NoError(t, err, fmt.Sprintf("Failed to setup local msp for testing, got err %s", err))
+	identity := mspmgmt.GetLocalSigningIdentityOrPanic(factory.GetDefault())
+	serializedID, err := identity.Serialize()
+	require.NoError(t, err, fmt.Sprintf("Serialize should have succeeded, got err %s", err))
+	data := []byte{1, 2, 3}
+	signature, err := identity.Sign(data)
+	require.NoError(t, err, fmt.Sprintf("Could not sign identity, got err %s", err))
+	mspID := "Org1MSP"
+	peerSelfSignedData := protoutil.SignedData{
+		Identity:  serializedID,
+		Signature: signature,
+		Data:      data,
+	}
+
 	metrics := metrics.NewGossipMetrics(&disabled.Provider{}).PrivdataMetrics
 
-	peerSelfSignedData := protoutil.SignedData{
-		Identity:  []byte{0, 1, 2},
-		Signature: []byte{3, 4, 5},
-		Data:      []byte{6, 7, 8},
-	}
 	hash := util2.ComputeSHA256([]byte("rws-pre-image"))
 	committer := &mocks.Committer{}
-	committer.On("CommitWithPvtData", mock.Anything).Run(func(args mock.Arguments) {
+	committer.On("CommitLegacy", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 		t.Fatal("Shouldn't have committed")
 	}).Return(nil)
-	cs := createcollectionStore(peerSelfSignedData).thatAcceptsAll()
-	purgedTxns := make(map[string]struct{})
-	store := &mockTransientStore{t: t}
+	cs := createcollectionStore(peerSelfSignedData).thatAcceptsAll().withMSPIdentity(identity.GetMSPIdentifier())
+
+	store := newTransientStore(t)
+	defer store.tearDown()
+
 	assertPurged := func(txns ...string) {
 		for _, txn := range txns {
-			_, exists := purgedTxns[txn]
-			assert.True(t, exists)
-			delete(purgedTxns, txn)
+			iterator, err := store.GetTxPvtRWSetByTxid(txn, nil)
+			if err != nil {
+				t.Fatalf("Failed iterating, got err %s", err)
+				iterator.Close()
+				return
+			}
+			res, err := iterator.Next()
+			if err != nil {
+				t.Fatalf("Failed iterating, got err %s", err)
+				iterator.Close()
+				return
+			}
+			require.Nil(t, res)
+			iterator.Close()
 		}
-		assert.Len(t, purgedTxns, 0)
 	}
-	store.On("PurgeByTxids", mock.Anything).Run(func(args mock.Arguments) {
-		for _, txn := range args.Get(0).([]string) {
-			purgedTxns[txn] = struct{}{}
-		}
-	}).Return(nil)
 	fetcher := &fetcherMock{t: t}
 	pdFactory := &pvtDataFactory{}
 	bf := &blockFactory{
-		channelID: "test",
+		channelID: "testchannelid",
 	}
 
+	idDeserializerFactory := IdentityDeserializerFactoryFunc(func(chainID string) msp.IdentityDeserializer {
+		return mgmt.GetManagerForChain("testchannelid")
+	})
 	block := bf.withoutMetadata().create()
 	// Scenario I: Block we got doesn't have any metadata with it
 	pvtData := pdFactory.create()
-	coordinator := NewCoordinator(Support{
-		CollectionStore: cs,
-		Committer:       committer,
-		Fetcher:         fetcher,
-		TransientStore:  store,
-		Validator:       &validatorMock{},
-	}, peerSelfSignedData, metrics, testConfig)
-	err := coordinator.StoreBlock(block, pvtData)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "Block.Metadata is nil or Block.Metadata lacks a Tx filter bitmap")
+	committer.On("DoesPvtDataInfoExistInLedger", mock.Anything).Return(false, nil)
+	capabilityProvider := &capabilitymock.CapabilityProvider{}
+	appCapability := &capabilitymock.AppCapabilities{}
+	capabilityProvider.On("Capabilities").Return(appCapability)
+	appCapability.On("StorePvtDataOfInvalidTx").Return(true)
+	coordinator := NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    cs,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, store.store, peerSelfSignedData, metrics, testConfig, idDeserializerFactory)
+	err = coordinator.StoreBlock(block, pvtData)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Block.Metadata is nil or Block.Metadata lacks a Tx filter bitmap")
 
 	// Scenario II: Validator has an error while validating the block
 	block = bf.create()
 	pvtData = pdFactory.create()
-	coordinator = NewCoordinator(Support{
-		CollectionStore: cs,
-		Committer:       committer,
-		Fetcher:         fetcher,
-		TransientStore:  store,
-		Validator:       &validatorMock{fmt.Errorf("failed validating block")},
-	}, peerSelfSignedData, metrics, testConfig)
+	coordinator = NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    cs,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{fmt.Errorf("failed validating block")},
+		CapabilityProvider: capabilityProvider,
+	}, store.store, peerSelfSignedData, metrics, testConfig, idDeserializerFactory)
 	err = coordinator.StoreBlock(block, pvtData)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "failed validating block")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed validating block")
 
 	// Scenario III: Block we got contains an inadequate length of Tx filter in the metadata
 	block = bf.withMetadataSize(100).create()
 	pvtData = pdFactory.create()
-	coordinator = NewCoordinator(Support{
-		CollectionStore: cs,
-		Committer:       committer,
-		Fetcher:         fetcher,
-		TransientStore:  store,
-		Validator:       &validatorMock{},
-	}, peerSelfSignedData, metrics, testConfig)
+	coordinator = NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    cs,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, store.store, peerSelfSignedData, metrics, testConfig, idDeserializerFactory)
 	err = coordinator.StoreBlock(block, pvtData)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "Block data size")
-	assert.Contains(t, err.Error(), "is different from Tx filter size")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "block data size")
+	require.Contains(t, err.Error(), "is different from Tx filter size")
 
 	// Scenario IV: The second transaction in the block we got is invalid, and we have no private data for that.
-	// If the coordinator would try to fetch private data, the test would fall because we haven't defined the
-	// mock operations for the transientstore (or for gossip) in this test.
+	// As the StorePvtDataOfInvalidTx is set of false, if the coordinator would try to fetch private data, the
+	// test would fall because we haven't defined the mock operations for the transientstore (or for gossip)
+	// in this test.
 	var commitHappened bool
 	assertCommitHappened := func() {
-		assert.True(t, commitHappened)
+		require.True(t, commitHappened)
 		commitHappened = false
 	}
+	digKeys := []privdatacommon.DigKey{
+		{
+			TxId:       "tx2",
+			Namespace:  "ns2",
+			Collection: "c1",
+			BlockSeq:   1,
+			SeqInBlock: 1,
+		},
+	}
+	fetcher = &fetcherMock{t: t}
+	fetcher.On("fetch", mock.Anything).expectingDigests(digKeys).expectingEndorsers(identity.GetMSPIdentifier()).Return(&privdatacommon.FetchedPvtDataContainer{
+		AvailableElements: nil,
+	}, nil)
 	committer = &mocks.Committer{}
-	committer.On("CommitWithPvtData", mock.Anything).Run(func(args mock.Arguments) {
+	committer.On("CommitLegacy", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 		privateDataPassed2Ledger := args.Get(0).(*ledger.BlockAndPvtData).PvtData
 		commitHappened = true
 		// Only the first transaction's private data is passed to the ledger
-		assert.Len(t, privateDataPassed2Ledger, 1)
-		assert.Equal(t, 0, int(privateDataPassed2Ledger[0].SeqInBlock))
+		require.Len(t, privateDataPassed2Ledger, 1)
+		require.Equal(t, 0, int(privateDataPassed2Ledger[0].SeqInBlock))
 		// The private data passed to the ledger contains "ns1" and has 2 collections in it
-		assert.Len(t, privateDataPassed2Ledger[0].WriteSet.NsPvtRwset, 1)
-		assert.Equal(t, "ns1", privateDataPassed2Ledger[0].WriteSet.NsPvtRwset[0].Namespace)
-		assert.Len(t, privateDataPassed2Ledger[0].WriteSet.NsPvtRwset[0].CollectionPvtRwset, 2)
+		require.Len(t, privateDataPassed2Ledger[0].WriteSet.NsPvtRwset, 1)
+		require.Equal(t, "ns1", privateDataPassed2Ledger[0].WriteSet.NsPvtRwset[0].Namespace)
+		require.Len(t, privateDataPassed2Ledger[0].WriteSet.NsPvtRwset[0].CollectionPvtRwset, 2)
 	}).Return(nil)
 	block = bf.withInvalidTxns(1).AddTxn("tx1", "ns1", hash, "c1", "c2").AddTxn("tx2", "ns2", hash, "c1").create()
 	pvtData = pdFactory.addRWSet().addNSRWSet("ns1", "c1", "c2").create()
-	coordinator = NewCoordinator(Support{
-		CollectionStore: cs,
-		Committer:       committer,
-		Fetcher:         fetcher,
-		TransientStore:  store,
-		Validator:       &validatorMock{},
-	}, peerSelfSignedData, metrics, testConfig)
+	committer.On("DoesPvtDataInfoExistInLedger", mock.Anything).Return(false, nil)
+
+	capabilityProvider = &capabilitymock.CapabilityProvider{}
+	appCapability = &capabilitymock.AppCapabilities{}
+	capabilityProvider.On("Capabilities").Return(appCapability)
+	appCapability.On("StorePvtDataOfInvalidTx").Return(false)
+	coordinator = NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    cs,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, store.store, peerSelfSignedData, metrics, testConfig, idDeserializerFactory)
 	err = coordinator.StoreBlock(block, pvtData)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertCommitHappened()
 	// Ensure the 2nd transaction which is invalid and wasn't committed - is still purged.
 	// This is so that if we get a transaction via dissemination from an endorser, we purge it
 	// when its block comes.
 	assertPurged("tx1", "tx2")
 
-	// Scenario V: Block doesn't contain a header
+	// Scenario V: The second transaction in the block we got is invalid, and we have no private
+	// data for that in the transient store. As we have set StorePvtDataOfInvalidTx to true and
+	// configured the coordinator to skip pulling pvtData of invalid transactions from other peers,
+	// it should not store the pvtData of invalid transaction in the ledger instead a missing entry.
+	testConfig.SkipPullingInvalidTransactions = true
+	assertCommitHappened = func() {
+		require.True(t, commitHappened)
+		commitHappened = false
+	}
+	committer = &mocks.Committer{}
+	committer.On("CommitLegacy", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		blockAndPvtData := args.Get(0).(*ledger.BlockAndPvtData)
+		commitHappened = true
+		// Only the first transaction's private data is passed to the ledger
+		privateDataPassed2Ledger := blockAndPvtData.PvtData
+		require.Len(t, privateDataPassed2Ledger, 1)
+		require.Equal(t, 0, int(privateDataPassed2Ledger[0].SeqInBlock))
+		// The private data passed to the ledger contains "ns1" and has 2 collections in it
+		require.Len(t, privateDataPassed2Ledger[0].WriteSet.NsPvtRwset, 1)
+		require.Equal(t, "ns1", privateDataPassed2Ledger[0].WriteSet.NsPvtRwset[0].Namespace)
+		require.Len(t, privateDataPassed2Ledger[0].WriteSet.NsPvtRwset[0].CollectionPvtRwset, 2)
+
+		missingPrivateDataPassed2Ledger := blockAndPvtData.MissingPvtData
+		require.Len(t, missingPrivateDataPassed2Ledger, 1)
+		require.Len(t, missingPrivateDataPassed2Ledger[1], 1)
+		require.Equal(t, missingPrivateDataPassed2Ledger[1][0].Namespace, "ns2")
+		require.Equal(t, missingPrivateDataPassed2Ledger[1][0].Collection, "c1")
+		require.Equal(t, missingPrivateDataPassed2Ledger[1][0].IsEligible, true)
+
+		commitOpts := args.Get(1).(*ledger.CommitOptions)
+		expectedCommitOpts := &ledger.CommitOptions{FetchPvtDataFromLedger: false}
+		require.Equal(t, expectedCommitOpts, commitOpts)
+	}).Return(nil)
+
+	block = bf.withInvalidTxns(1).AddTxn("tx1", "ns1", hash, "c1", "c2").AddTxn("tx2", "ns2", hash, "c1").create()
+	pvtData = pdFactory.addRWSet().addNSRWSet("ns1", "c1", "c2").create()
+	committer.On("DoesPvtDataInfoExistInLedger", mock.Anything).Return(false, nil)
+	capabilityProvider = &capabilitymock.CapabilityProvider{}
+	appCapability = &capabilitymock.AppCapabilities{}
+	capabilityProvider.On("Capabilities").Return(appCapability)
+	appCapability.On("StorePvtDataOfInvalidTx").Return(true)
+	digKeys = []privdatacommon.DigKey{}
+	fetcher = &fetcherMock{t: t}
+	fetcher.On("fetch", mock.Anything).expectingDigests(digKeys).Return(&privdatacommon.FetchedPvtDataContainer{
+		AvailableElements: nil,
+	}, nil)
+	coordinator = NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    cs,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, store.store, peerSelfSignedData, metrics, testConfig, idDeserializerFactory)
+	err = coordinator.StoreBlock(block, pvtData)
+	require.NoError(t, err)
+	assertCommitHappened()
+	assertPurged("tx1", "tx2")
+
+	// Scenario VI: The second transaction in the block we got is invalid. As we have set the
+	// StorePvtDataOfInvalidTx to true and configured the coordinator to pull pvtData of invalid
+	// transactions, it should store the pvtData of invalid transactions in the ledger.
+	testConfig.SkipPullingInvalidTransactions = false
+	committer = &mocks.Committer{}
+	committer.On("CommitLegacy", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		blockAndPvtData := args.Get(0).(*ledger.BlockAndPvtData)
+		commitHappened = true
+		// pvtData of both transactions must be present though the second transaction
+		// is invalid.
+		privateDataPassed2Ledger := blockAndPvtData.PvtData
+		require.Len(t, privateDataPassed2Ledger, 2)
+		require.Equal(t, 0, int(privateDataPassed2Ledger[0].SeqInBlock))
+		require.Equal(t, 1, int(privateDataPassed2Ledger[1].SeqInBlock))
+		// The private data passed to the ledger for tx1 contains "ns1" and has 2 collections in it
+		require.Len(t, privateDataPassed2Ledger[0].WriteSet.NsPvtRwset, 1)
+		require.Equal(t, "ns1", privateDataPassed2Ledger[0].WriteSet.NsPvtRwset[0].Namespace)
+		require.Len(t, privateDataPassed2Ledger[0].WriteSet.NsPvtRwset[0].CollectionPvtRwset, 2)
+		// The private data passed to the ledger for tx2 contains "ns2" and has 1 collection in it
+		require.Len(t, privateDataPassed2Ledger[1].WriteSet.NsPvtRwset, 1)
+		require.Equal(t, "ns2", privateDataPassed2Ledger[1].WriteSet.NsPvtRwset[0].Namespace)
+		require.Len(t, privateDataPassed2Ledger[1].WriteSet.NsPvtRwset[0].CollectionPvtRwset, 1)
+
+		missingPrivateDataPassed2Ledger := blockAndPvtData.MissingPvtData
+		require.Len(t, missingPrivateDataPassed2Ledger, 0)
+
+		commitOpts := args.Get(1).(*ledger.CommitOptions)
+		expectedCommitOpts := &ledger.CommitOptions{FetchPvtDataFromLedger: false}
+		require.Equal(t, expectedCommitOpts, commitOpts)
+	}).Return(nil)
+
+	fetcher = &fetcherMock{t: t}
+	fetcher.On("fetch", mock.Anything).expectingDigests([]privdatacommon.DigKey{
+		{
+			TxId: "tx2", Namespace: "ns2", Collection: "c1", BlockSeq: 1, SeqInBlock: 1,
+		},
+	}).Return(&privdatacommon.FetchedPvtDataContainer{
+		AvailableElements: []*proto.PvtDataElement{
+			{
+				Digest: &proto.PvtDataDigest{
+					SeqInBlock: 1,
+					BlockSeq:   1,
+					Collection: "c1",
+					Namespace:  "ns2",
+					TxId:       "tx2",
+				},
+				Payload: [][]byte{[]byte("rws-pre-image")},
+			},
+		},
+	}, nil)
+
+	block = bf.withInvalidTxns(1).AddTxnWithEndorsement("tx1", "ns1", hash, "org1", true, "c1", "c2").
+		AddTxnWithEndorsement("tx2", "ns2", hash, "org2", true, "c1").create()
+	pvtData = pdFactory.addRWSet().addNSRWSet("ns1", "c1", "c2").create()
+	committer.On("DoesPvtDataInfoExistInLedger", mock.Anything).Return(false, nil)
+	coordinator = NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    cs,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, store.store, peerSelfSignedData, metrics, testConfig, idDeserializerFactory)
+	err = coordinator.StoreBlock(block, pvtData)
+	require.NoError(t, err)
+	assertCommitHappened()
+	assertPurged("tx1", "tx2")
+
+	// Scenario VII: Block doesn't contain a header
 	block.Header = nil
 	err = coordinator.StoreBlock(block, pvtData)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "Block header is nil")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Block header is nil")
 
-	// Scenario VI: Block doesn't contain Data
+	// Scenario VIII: Block doesn't contain Data
 	block.Data = nil
 	err = coordinator.StoreBlock(block, pvtData)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "Block data is empty")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Block data is empty")
 }
 
 func TestCoordinatorToFilterOutPvtRWSetsWithWrongHash(t *testing.T) {
@@ -764,10 +886,19 @@ func TestCoordinatorToFilterOutPvtRWSetsWithWrongHash(t *testing.T) {
 		it has ns1:c1 in transient store, while it has wrong
 		hash, hence it will fetch ns1:c1 from other peers
 	*/
+	err := msptesttools.LoadMSPSetupForTesting()
+	require.NoError(t, err, fmt.Sprintf("Failed to setup local msp for testing, got err %s", err))
+	identity := mspmgmt.GetLocalSigningIdentityOrPanic(factory.GetDefault())
+	serializedID, err := identity.Serialize()
+	require.NoError(t, err, fmt.Sprintf("Serialize should have succeeded, got err %s", err))
+	data := []byte{1, 2, 3}
+	signature, err := identity.Sign(data)
+	require.NoError(t, err, fmt.Sprintf("Could not sign identity, got err %s", err))
+	mspID := "Org1MSP"
 	peerSelfSignedData := protoutil.SignedData{
-		Identity:  []byte{0, 1, 2},
-		Signature: []byte{3, 4, 5},
-		Data:      []byte{6, 7, 8},
+		Identity:  serializedID,
+		Signature: signature,
+		Data:      data,
 	}
 
 	expectedPvtData := map[uint64]*ledger.TxPvtData{
@@ -787,44 +918,78 @@ func TestCoordinatorToFilterOutPvtRWSetsWithWrongHash(t *testing.T) {
 		}},
 	}
 
-	cs := createcollectionStore(peerSelfSignedData).thatAcceptsAll()
+	cs := createcollectionStore(peerSelfSignedData).thatAcceptsAll().withMSPIdentity(identity.GetMSPIdentifier())
 	committer := &mocks.Committer{}
-	store := &mockTransientStore{t: t}
+
+	store := newTransientStore(t)
+	defer store.tearDown()
+
+	assertPurged := func(txns ...string) {
+		for _, txn := range txns {
+			iterator, err := store.GetTxPvtRWSetByTxid(txn, nil)
+			if err != nil {
+				t.Fatalf("Failed iterating, got err %s", err)
+				iterator.Close()
+				return
+			}
+			res, err := iterator.Next()
+			if err != nil {
+				t.Fatalf("Failed iterating, got err %s", err)
+				iterator.Close()
+				return
+			}
+			require.Nil(t, res)
+			iterator.Close()
+		}
+	}
 
 	fetcher := &fetcherMock{t: t}
 
 	var commitHappened bool
 
-	committer.On("CommitWithPvtData", mock.Anything).Run(func(args mock.Arguments) {
+	committer.On("CommitLegacy", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 		privateDataPassed2Ledger := args.Get(0).(*ledger.BlockAndPvtData).PvtData
-		assert.True(t, reflect.DeepEqual(flattenTxPvtDataMap(privateDataPassed2Ledger),
+		require.True(t, reflect.DeepEqual(flattenTxPvtDataMap(privateDataPassed2Ledger),
 			flattenTxPvtDataMap(expectedPvtData)))
 		commitHappened = true
+
+		commitOpts := args.Get(1).(*ledger.CommitOptions)
+		expectedCommitOpts := &ledger.CommitOptions{FetchPvtDataFromLedger: false}
+		require.Equal(t, expectedCommitOpts, commitOpts)
 	}).Return(nil)
 
 	hash := util2.ComputeSHA256([]byte("rws-original"))
 	bf := &blockFactory{
-		channelID: "test",
+		channelID: "testchannelid",
 	}
 
+	idDeserializerFactory := IdentityDeserializerFactoryFunc(func(chainID string) msp.IdentityDeserializer {
+		return mgmt.GetManagerForChain("testchannelid")
+	})
+
 	block := bf.AddTxnWithEndorsement("tx1", "ns1", hash, "org1", true, "c1").create()
-	store.On("GetTxPvtRWSetByTxid", "tx1", mock.Anything).Return((&mockRWSetScanner{}).withRWSet("ns1", "c1"), nil)
+	committer.On("DoesPvtDataInfoExistInLedger", mock.Anything).Return(false, nil)
 
 	metrics := metrics.NewGossipMetrics(&disabled.Provider{}).PrivdataMetrics
 
-	coordinator := NewCoordinator(Support{
-		CollectionStore: cs,
-		Committer:       committer,
-		Fetcher:         fetcher,
-		TransientStore:  store,
-		Validator:       &validatorMock{},
-	}, peerSelfSignedData, metrics, testConfig)
+	capabilityProvider := &capabilitymock.CapabilityProvider{}
+	appCapability := &capabilitymock.AppCapabilities{}
+	capabilityProvider.On("Capabilities").Return(appCapability)
+	appCapability.On("StorePvtDataOfInvalidTx").Return(true)
+	coordinator := NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    cs,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, store.store, peerSelfSignedData, metrics, testConfig, idDeserializerFactory)
 
 	fetcher.On("fetch", mock.Anything).expectingDigests([]privdatacommon.DigKey{
 		{
 			TxId: "tx1", Namespace: "ns1", Collection: "c1", BlockSeq: 1,
 		},
-	}).expectingEndorsers("org1").Return(&privdatacommon.FetchedPvtDataContainer{
+	}).Return(&privdatacommon.FetchedPvtDataContainer{
 		AvailableElements: []*proto.PvtDataElement{
 			{
 				Digest: &proto.PvtDataDigest{
@@ -837,61 +1002,71 @@ func TestCoordinatorToFilterOutPvtRWSetsWithWrongHash(t *testing.T) {
 			},
 		},
 	}, nil)
-	store.On("Persist", mock.Anything, uint64(1), mock.Anything).
-		expectRWSet("ns1", "c1", []byte("rws-original")).Return(nil)
-
-	purgedTxns := make(map[string]struct{})
-	store.On("PurgeByTxids", mock.Anything).Run(func(args mock.Arguments) {
-		for _, txn := range args.Get(0).([]string) {
-			purgedTxns[txn] = struct{}{}
-		}
-	}).Return(nil)
 
 	coordinator.StoreBlock(block, nil)
 	// Assert blocks was eventually committed
-	assert.True(t, commitHappened)
+	require.True(t, commitHappened)
 
 	// Assert transaction has been purged
-	_, exists := purgedTxns["tx1"]
-	assert.True(t, exists)
+	assertPurged("tx1")
 }
 
 func TestCoordinatorStoreBlock(t *testing.T) {
+	err := msptesttools.LoadMSPSetupForTesting()
+	require.NoError(t, err, fmt.Sprintf("Failed to setup local msp for testing, got err %s", err))
+	identity := mspmgmt.GetLocalSigningIdentityOrPanic(factory.GetDefault())
+	serializedID, err := identity.Serialize()
+	require.NoError(t, err, fmt.Sprintf("Serialize should have succeeded, got err %s", err))
+	data := []byte{1, 2, 3}
+	signature, err := identity.Sign(data)
+	require.NoError(t, err, fmt.Sprintf("Could not sign identity, got err %s", err))
+	mspID := "Org1MSP"
 	peerSelfSignedData := protoutil.SignedData{
-		Identity:  []byte{0, 1, 2},
-		Signature: []byte{3, 4, 5},
-		Data:      []byte{6, 7, 8},
+		Identity:  serializedID,
+		Signature: signature,
+		Data:      data,
 	}
 	// Green path test, all private data should be obtained successfully
 
-	cs := createcollectionStore(peerSelfSignedData).thatAcceptsAll()
+	cs := createcollectionStore(peerSelfSignedData).thatAcceptsAll().withMSPIdentity(identity.GetMSPIdentifier())
 
 	var commitHappened bool
 	assertCommitHappened := func() {
-		assert.True(t, commitHappened)
+		require.True(t, commitHappened)
 		commitHappened = false
 	}
 	committer := &mocks.Committer{}
-	committer.On("CommitWithPvtData", mock.Anything).Run(func(args mock.Arguments) {
+	committer.On("CommitLegacy", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 		privateDataPassed2Ledger := args.Get(0).(*ledger.BlockAndPvtData).PvtData
-		assert.True(t, reflect.DeepEqual(flattenTxPvtDataMap(privateDataPassed2Ledger),
+		require.True(t, reflect.DeepEqual(flattenTxPvtDataMap(privateDataPassed2Ledger),
 			flattenTxPvtDataMap(expectedCommittedPrivateData1)))
 		commitHappened = true
+
+		commitOpts := args.Get(1).(*ledger.CommitOptions)
+		expectedCommitOpts := &ledger.CommitOptions{FetchPvtDataFromLedger: false}
+		require.Equal(t, expectedCommitOpts, commitOpts)
 	}).Return(nil)
-	purgedTxns := make(map[string]struct{})
-	store := &mockTransientStore{t: t}
-	store.On("PurgeByTxids", mock.Anything).Run(func(args mock.Arguments) {
-		for _, txn := range args.Get(0).([]string) {
-			purgedTxns[txn] = struct{}{}
-		}
-	}).Return(nil)
-	assertPurged := func(txns ...string) {
+
+	store := newTransientStore(t)
+	defer store.tearDown()
+
+	assertPurged := func(txns ...string) bool {
 		for _, txn := range txns {
-			_, exists := purgedTxns[txn]
-			assert.True(t, exists)
-			delete(purgedTxns, txn)
+			iterator, err := store.GetTxPvtRWSetByTxid(txn, nil)
+			if err != nil {
+				iterator.Close()
+				t.Fatalf("Failed iterating, got err %s", err)
+			}
+			res, err := iterator.Next()
+			iterator.Close()
+			if err != nil {
+				t.Fatalf("Failed iterating, got err %s", err)
+			}
+			if res != nil {
+				return false
+			}
 		}
-		assert.Len(t, purgedTxns, 0)
+		return true
 	}
 
 	fetcher := &fetcherMock{t: t}
@@ -899,8 +1074,13 @@ func TestCoordinatorStoreBlock(t *testing.T) {
 	hash := util2.ComputeSHA256([]byte("rws-pre-image"))
 	pdFactory := &pvtDataFactory{}
 	bf := &blockFactory{
-		channelID: "test",
+		channelID: "testchannelid",
 	}
+
+	idDeserializerFactory := IdentityDeserializerFactoryFunc(func(chainID string) msp.IdentityDeserializer {
+		return mgmt.GetManagerForChain("testchannelid")
+	})
+
 	block := bf.AddTxnWithEndorsement("tx1", "ns1", hash, "org1", true, "c1", "c2").
 		AddTxnWithEndorsement("tx2", "ns2", hash, "org2", true, "c1").create()
 
@@ -911,34 +1091,55 @@ func TestCoordinatorStoreBlock(t *testing.T) {
 	// If the coordinator tries fetching from the transientstore, or peers it would result in panic,
 	// because we didn't define yet the "On(...)" invocation of the transient store or other peers.
 	pvtData := pdFactory.addRWSet().addNSRWSet("ns1", "c1", "c2").addRWSet().addNSRWSet("ns2", "c1").create()
-	coordinator := NewCoordinator(Support{
-		CollectionStore: cs,
-		Committer:       committer,
-		Fetcher:         fetcher,
-		TransientStore:  store,
-		Validator:       &validatorMock{},
-	}, peerSelfSignedData, metrics, testConfig)
-	err := coordinator.StoreBlock(block, pvtData)
-	assert.NoError(t, err)
+	committer.On("DoesPvtDataInfoExistInLedger", mock.Anything).Return(false, nil)
+
+	capabilityProvider := &capabilitymock.CapabilityProvider{}
+	appCapability := &capabilitymock.AppCapabilities{}
+	capabilityProvider.On("Capabilities").Return(appCapability)
+	appCapability.On("StorePvtDataOfInvalidTx").Return(true)
+	coordinator := NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    cs,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, store.store, peerSelfSignedData, metrics, testConfig, idDeserializerFactory)
+	err = coordinator.StoreBlock(block, pvtData)
+	require.NoError(t, err)
 	assertCommitHappened()
-	assertPurged("tx1", "tx2")
+	assertPurgeTxs := func() bool {
+		return assertPurged("tx1", "tx2")
+	}
+	require.Eventually(t, assertPurgeTxs, 2*time.Second, 100*time.Millisecond)
 
 	fmt.Println("Scenario II")
 	// Scenario II: Block we got doesn't have sufficient private data alongside it,
 	// it is missing ns1: c2, but the data exists in the transient store
-	store.On("GetTxPvtRWSetByTxid", "tx1", mock.Anything).Return((&mockRWSetScanner{}).withRWSet("ns1", "c2"), nil)
-	store.On("GetTxPvtRWSetByTxid", "tx2", mock.Anything).Return(&mockRWSetScanner{}, nil)
+	store.Persist("tx1", 1, &tspb.TxPvtReadWriteSetWithConfigInfo{
+		PvtRwset: &rwset.TxPvtReadWriteSet{
+			NsPvtRwset: []*rwset.NsPvtReadWriteSet{
+				{
+					Namespace: "ns1",
+					CollectionPvtRwset: []*rwset.CollectionPvtReadWriteSet{
+						{
+							CollectionName: "c2",
+							Rwset:          []byte("rws-pre-image"),
+						},
+					},
+				},
+			},
+		},
+		CollectionConfigs: make(map[string]*peer.CollectionConfigPackage),
+	})
 	pvtData = pdFactory.addRWSet().addNSRWSet("ns1", "c1").addRWSet().addNSRWSet("ns2", "c1").create()
 	err = coordinator.StoreBlock(block, pvtData)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertCommitHappened()
-	assertPurged("tx1", "tx2")
-	assert.Equal(t, "tx1", store.lastReqTxID)
-	assert.Equal(t, map[string]ledger.PvtCollFilter{
-		"ns1": map[string]bool{
-			"c2": true,
-		},
-	}, store.lastReqFilter)
+	assertPurgeTxs = func() bool {
+		return assertPurged("tx1", "tx2")
+	}
+	require.Eventually(t, assertPurgeTxs, 2*time.Second, 100*time.Millisecond)
 
 	fmt.Println("Scenario III")
 	// Scenario III: Block doesn't have sufficient private data alongside it,
@@ -953,7 +1154,7 @@ func TestCoordinatorStoreBlock(t *testing.T) {
 		{
 			TxId: "tx2", Namespace: "ns2", Collection: "c1", BlockSeq: 1, SeqInBlock: 1,
 		},
-	}).expectingEndorsers("org1").Return(&privdatacommon.FetchedPvtDataContainer{
+	}).Return(&privdatacommon.FetchedPvtDataContainer{
 		AvailableElements: []*proto.PvtDataElement{
 			{
 				Digest: &proto.PvtDataDigest{
@@ -976,40 +1177,44 @@ func TestCoordinatorStoreBlock(t *testing.T) {
 			},
 		},
 	}, nil)
-	store.On("Persist", mock.Anything, uint64(1), mock.Anything).
-		expectRWSet("ns1", "c2", []byte("rws-pre-image")).
-		expectRWSet("ns2", "c1", []byte("rws-pre-image")).Return(nil)
 	pvtData = pdFactory.addRWSet().addNSRWSet("ns1", "c1").create()
 	err = coordinator.StoreBlock(block, pvtData)
-	assertPurged("tx1", "tx2")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertCommitHappened()
+	assertPurgeTxs = func() bool {
+		return assertPurged("tx1", "tx2")
+	}
+	require.Eventually(t, assertPurgeTxs, 2*time.Second, 100*time.Millisecond)
 
 	fmt.Println("Scenario IV")
 	// Scenario IV: Block came with more than sufficient private data alongside it, some of it is redundant.
 	pvtData = pdFactory.addRWSet().addNSRWSet("ns1", "c1", "c2", "c3").
 		addRWSet().addNSRWSet("ns2", "c1", "c3").addRWSet().addNSRWSet("ns1", "c4").create()
 	err = coordinator.StoreBlock(block, pvtData)
-	assertPurged("tx1", "tx2")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertCommitHappened()
+	assertPurgeTxs = func() bool {
+		return assertPurged("tx1", "tx2")
+	}
+	require.Eventually(t, assertPurgeTxs, 2*time.Second, 100*time.Millisecond)
 
 	fmt.Println("Scenario V")
 	// Scenario V: Block we got has private data alongside it but coordinator cannot retrieve collection access
 	// policy of collections due to databse unavailability error.
 	// we verify that the error propagates properly.
 	mockCs := &mocks.CollectionStore{}
-	mockCs.On("RetrieveCollectionAccessPolicy", mock.Anything).Return(nil, errors.New("test error"))
-	coordinator = NewCoordinator(Support{
-		CollectionStore: mockCs,
-		Committer:       committer,
-		Fetcher:         fetcher,
-		TransientStore:  store,
-		Validator:       &validatorMock{},
-	}, peerSelfSignedData, metrics, testConfig)
+	mockCs.On("RetrieveCollectionConfig", mock.Anything).Return(nil, errors.New("test error"))
+	coordinator = NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    mockCs,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, store.store, peerSelfSignedData, metrics, testConfig, idDeserializerFactory)
 	err = coordinator.StoreBlock(block, nil)
-	assert.Error(t, err)
-	assert.Equal(t, "test error", err.Error())
+	require.Error(t, err)
+	require.Equal(t, "test error", err.Error())
 
 	fmt.Println("Scenario VI")
 	// Scenario VI: Block didn't get with any private data alongside it, and the transient store
@@ -1034,32 +1239,33 @@ func TestCoordinatorStoreBlock(t *testing.T) {
 			},
 		},
 	}, nil)
-	store = &mockTransientStore{t: t}
-	store.On("PurgeByTxids", mock.Anything).Run(func(args mock.Arguments) {
-		for _, txn := range args.Get(0).([]string) {
-			purgedTxns[txn] = struct{}{}
-		}
-	}).Return(nil)
-	store.On("GetTxPvtRWSetByTxid", "tx3", mock.Anything).Return(&mockRWSetScanner{err: errors.New("uh oh")}, nil)
-	store.On("Persist", mock.Anything, uint64(1), mock.Anything).expectRWSet("ns3", "c3", []byte("rws-pre-image"))
 	committer = &mocks.Committer{}
-	committer.On("CommitWithPvtData", mock.Anything).Run(func(args mock.Arguments) {
+	committer.On("CommitLegacy", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 		privateDataPassed2Ledger := args.Get(0).(*ledger.BlockAndPvtData).PvtData
-		assert.True(t, reflect.DeepEqual(flattenTxPvtDataMap(privateDataPassed2Ledger),
+		require.True(t, reflect.DeepEqual(flattenTxPvtDataMap(privateDataPassed2Ledger),
 			flattenTxPvtDataMap(expectedCommittedPrivateData2)))
 		commitHappened = true
+
+		commitOpts := args.Get(1).(*ledger.CommitOptions)
+		expectedCommitOpts := &ledger.CommitOptions{FetchPvtDataFromLedger: false}
+		require.Equal(t, expectedCommitOpts, commitOpts)
 	}).Return(nil)
-	coordinator = NewCoordinator(Support{
-		CollectionStore: cs,
-		Committer:       committer,
-		Fetcher:         fetcher,
-		TransientStore:  store,
-		Validator:       &validatorMock{},
-	}, peerSelfSignedData, metrics, testConfig)
+	committer.On("DoesPvtDataInfoExistInLedger", mock.Anything).Return(false, nil)
+	coordinator = NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    cs,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, store.store, peerSelfSignedData, metrics, testConfig, idDeserializerFactory)
 	err = coordinator.StoreBlock(block, nil)
-	assertPurged("tx3")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertCommitHappened()
+	assertPurgeTxs = func() bool {
+		return assertPurged("tx3")
+	}
+	require.Eventually(t, assertPurgeTxs, 2*time.Second, 100*time.Millisecond)
 
 	fmt.Println("Scenario VII")
 	// Scenario VII: Block contains 2 transactions, and the peer is eligible for only tx3-ns3-c3.
@@ -1068,82 +1274,175 @@ func TestCoordinatorStoreBlock(t *testing.T) {
 	// for from the transient store or from peers - the test would fail because the Mock wasn't initialized.
 	block = bf.AddTxn("tx3", "ns3", hash, "c3", "c2", "c1").AddTxn("tx1", "ns1", hash, "c1").create()
 	cs = createcollectionStore(peerSelfSignedData).thatAccepts(CollectionCriteria{
-		TxId:       "tx3",
 		Collection: "c3",
 		Namespace:  "ns3",
-		Channel:    "test",
-	})
-	store = &mockTransientStore{t: t}
-	store.On("PurgeByTxids", mock.Anything).Run(func(args mock.Arguments) {
-		for _, txn := range args.Get(0).([]string) {
-			purgedTxns[txn] = struct{}{}
-		}
-	}).Return(nil)
+		Channel:    "testchannelid",
+	}).withMSPIdentity(identity.GetMSPIdentifier())
 	fetcher = &fetcherMock{t: t}
 	committer = &mocks.Committer{}
-	committer.On("CommitWithPvtData", mock.Anything).Run(func(args mock.Arguments) {
+	committer.On("CommitLegacy", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 		privateDataPassed2Ledger := args.Get(0).(*ledger.BlockAndPvtData).PvtData
-		assert.True(t, reflect.DeepEqual(flattenTxPvtDataMap(privateDataPassed2Ledger),
+		require.True(t, reflect.DeepEqual(flattenTxPvtDataMap(privateDataPassed2Ledger),
 			flattenTxPvtDataMap(expectedCommittedPrivateData2)))
 		commitHappened = true
+
+		commitOpts := args.Get(1).(*ledger.CommitOptions)
+		expectedCommitOpts := &ledger.CommitOptions{FetchPvtDataFromLedger: false}
+		require.Equal(t, expectedCommitOpts, commitOpts)
 	}).Return(nil)
-	coordinator = NewCoordinator(Support{
-		CollectionStore: cs,
-		Committer:       committer,
-		Fetcher:         fetcher,
-		TransientStore:  store,
-		Validator:       &validatorMock{},
-	}, peerSelfSignedData, metrics, testConfig)
+	committer.On("DoesPvtDataInfoExistInLedger", mock.Anything).Return(false, nil)
+	coordinator = NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    cs,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, store.store, peerSelfSignedData, metrics, testConfig, idDeserializerFactory)
 
 	pvtData = pdFactory.addRWSet().addNSRWSet("ns3", "c3").create()
 	err = coordinator.StoreBlock(block, pvtData)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertCommitHappened()
 	// In any case, all transactions in the block are purged from the transient store
-	assertPurged("tx3", "tx1")
+	assertPurgeTxs = func() bool {
+		return assertPurged("tx3", "tx1")
+	}
+	require.Eventually(t, assertPurgeTxs, 2*time.Second, 100*time.Millisecond)
+}
+
+func TestCoordinatorStoreBlockWhenPvtDataExistInLedger(t *testing.T) {
+	err := msptesttools.LoadMSPSetupForTesting()
+	require.NoError(t, err, fmt.Sprintf("Failed to setup local msp for testing, got err %s", err))
+	identity := mspmgmt.GetLocalSigningIdentityOrPanic(factory.GetDefault())
+	serializedID, err := identity.Serialize()
+	require.NoError(t, err, fmt.Sprintf("Serialize should have succeeded, got err %s", err))
+	data := []byte{1, 2, 3}
+	signature, err := identity.Sign(data)
+	require.NoError(t, err, fmt.Sprintf("Could not sign identity, got err %s", err))
+	mspID := "Org1MSP"
+	peerSelfSignedData := protoutil.SignedData{
+		Identity:  serializedID,
+		Signature: signature,
+		Data:      data,
+	}
+
+	var commitHappened bool
+	assertCommitHappened := func() {
+		require.True(t, commitHappened)
+		commitHappened = false
+	}
+	committer := &mocks.Committer{}
+	committer.On("CommitLegacy", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
+		privateDataPassed2Ledger := args.Get(0).(*ledger.BlockAndPvtData).PvtData
+		require.Equal(t, ledger.TxPvtDataMap{}, privateDataPassed2Ledger)
+		commitOpts := args.Get(1).(*ledger.CommitOptions)
+		expectedCommitOpts := &ledger.CommitOptions{FetchPvtDataFromLedger: true}
+		require.Equal(t, expectedCommitOpts, commitOpts)
+		commitHappened = true
+	}).Return(nil)
+
+	fetcher := &fetcherMock{t: t}
+
+	hash := util2.ComputeSHA256([]byte("rws-pre-image"))
+	pdFactory := &pvtDataFactory{}
+	bf := &blockFactory{
+		channelID: "testchannelid",
+	}
+
+	idDeserializerFactory := IdentityDeserializerFactoryFunc(func(chainID string) msp.IdentityDeserializer {
+		return mgmt.GetManagerForChain("testchannelid")
+	})
+
+	block := bf.AddTxnWithEndorsement("tx1", "ns1", hash, "org1", true, "c1", "c2").
+		AddTxnWithEndorsement("tx2", "ns2", hash, "org2", true, "c1").create()
+
+	// Scenario: Block we got has been reprocessed and hence the sufficient pvtData is present
+	// in the local pvtdataStore itself. The pvtData would be fetched from the local pvtdataStore.
+	// If the coordinator tries fetching from the transientstore, or peers it would result in panic,
+	// because we didn't define yet the "On(...)" invocation of the transient store or other peers.
+	pvtData := pdFactory.addRWSet().addNSRWSet("ns1", "c1", "c2").addRWSet().addNSRWSet("ns2", "c1").create()
+	committer.On("DoesPvtDataInfoExistInLedger", mock.Anything).Return(true, nil)
+
+	metrics := metrics.NewGossipMetrics(&disabled.Provider{}).PrivdataMetrics
+
+	capabilityProvider := &capabilitymock.CapabilityProvider{}
+	appCapability := &capabilitymock.AppCapabilities{}
+	capabilityProvider.On("Capabilities").Return(appCapability)
+	appCapability.On("StorePvtDataOfInvalidTx").Return(true)
+	coordinator := NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    nil,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, nil, peerSelfSignedData, metrics, testConfig, idDeserializerFactory)
+	err = coordinator.StoreBlock(block, pvtData)
+	require.NoError(t, err)
+	assertCommitHappened()
 }
 
 func TestProceedWithoutPrivateData(t *testing.T) {
 	// Scenario: we are missing private data (c2 in ns3) and it cannot be obtained from any peer.
 	// Block needs to be committed with missing private data.
+	err := msptesttools.LoadMSPSetupForTesting()
+	require.NoError(t, err, fmt.Sprintf("Failed to setup local msp for testing, got err %s", err))
+	identity := mspmgmt.GetLocalSigningIdentityOrPanic(factory.GetDefault())
+	serializedID, err := identity.Serialize()
+	require.NoError(t, err, fmt.Sprintf("Serialize should have succeeded, got err %s", err))
+	data := []byte{1, 2, 3}
+	signature, err := identity.Sign(data)
+	require.NoError(t, err, fmt.Sprintf("Could not sign identity, got err %s", err))
+	mspID := "Org1MSP"
 	peerSelfSignedData := protoutil.SignedData{
-		Identity:  []byte{0, 1, 2},
-		Signature: []byte{3, 4, 5},
-		Data:      []byte{6, 7, 8},
+		Identity:  serializedID,
+		Signature: signature,
+		Data:      data,
 	}
-	cs := createcollectionStore(peerSelfSignedData).thatAcceptsAll()
+	cs := createcollectionStore(peerSelfSignedData).thatAcceptsAll().withMSPIdentity(identity.GetMSPIdentifier())
 	var commitHappened bool
 	assertCommitHappened := func() {
-		assert.True(t, commitHappened)
+		require.True(t, commitHappened)
 		commitHappened = false
 	}
 	committer := &mocks.Committer{}
-	committer.On("CommitWithPvtData", mock.Anything).Run(func(args mock.Arguments) {
+	committer.On("CommitLegacy", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 		blockAndPrivateData := args.Get(0).(*ledger.BlockAndPvtData)
 		privateDataPassed2Ledger := blockAndPrivateData.PvtData
-		assert.True(t, reflect.DeepEqual(flattenTxPvtDataMap(privateDataPassed2Ledger),
+		require.True(t, reflect.DeepEqual(flattenTxPvtDataMap(privateDataPassed2Ledger),
 			flattenTxPvtDataMap(expectedCommittedPrivateData2)))
 		missingPrivateData := blockAndPrivateData.MissingPvtData
 		expectedMissingPvtData := make(ledger.TxMissingPvtDataMap)
 		expectedMissingPvtData.Add(0, "ns3", "c2", true)
-		assert.Equal(t, expectedMissingPvtData, missingPrivateData)
+		require.Equal(t, expectedMissingPvtData, missingPrivateData)
 		commitHappened = true
+
+		commitOpts := args.Get(1).(*ledger.CommitOptions)
+		expectedCommitOpts := &ledger.CommitOptions{FetchPvtDataFromLedger: false}
+		require.Equal(t, expectedCommitOpts, commitOpts)
 	}).Return(nil)
-	purgedTxns := make(map[string]struct{})
-	store := &mockTransientStore{t: t}
-	store.On("GetTxPvtRWSetByTxid", "tx1", mock.Anything).Return(&mockRWSetScanner{}, nil)
-	store.On("PurgeByTxids", mock.Anything).Run(func(args mock.Arguments) {
-		for _, txn := range args.Get(0).([]string) {
-			purgedTxns[txn] = struct{}{}
-		}
-	}).Return(nil)
+
+	store := newTransientStore(t)
+	defer store.tearDown()
+
 	assertPurged := func(txns ...string) {
 		for _, txn := range txns {
-			_, exists := purgedTxns[txn]
-			assert.True(t, exists)
-			delete(purgedTxns, txn)
+			iterator, err := store.GetTxPvtRWSetByTxid(txn, nil)
+			if err != nil {
+				t.Fatalf("Failed iterating, got err %s", err)
+				iterator.Close()
+				return
+			}
+			res, err := iterator.Next()
+			if err != nil {
+				t.Fatalf("Failed iterating, got err %s", err)
+				iterator.Close()
+				return
+			}
+			require.Nil(t, res)
+			iterator.Close()
 		}
-		assert.Len(t, purgedTxns, 0)
 	}
 
 	fetcher := &fetcherMock{t: t}
@@ -1169,22 +1468,33 @@ func TestProceedWithoutPrivateData(t *testing.T) {
 	hash := util2.ComputeSHA256([]byte("rws-pre-image"))
 	pdFactory := &pvtDataFactory{}
 	bf := &blockFactory{
-		channelID: "test",
+		channelID: "testchannelid",
 	}
+
+	idDeserializerFactory := IdentityDeserializerFactoryFunc(func(chainID string) msp.IdentityDeserializer {
+		return mgmt.GetManagerForChain("testchannelid")
+	})
 
 	metrics := metrics.NewGossipMetrics(&disabled.Provider{}).PrivdataMetrics
 
 	block := bf.AddTxn("tx1", "ns3", hash, "c3", "c2").create()
 	pvtData := pdFactory.addRWSet().addNSRWSet("ns3", "c3").create()
-	coordinator := NewCoordinator(Support{
-		CollectionStore: cs,
-		Committer:       committer,
-		Fetcher:         fetcher,
-		TransientStore:  store,
-		Validator:       &validatorMock{},
-	}, peerSelfSignedData, metrics, testConfig)
-	err := coordinator.StoreBlock(block, pvtData)
-	assert.NoError(t, err)
+	committer.On("DoesPvtDataInfoExistInLedger", mock.Anything).Return(false, nil)
+
+	capabilityProvider := &capabilitymock.CapabilityProvider{}
+	appCapability := &capabilitymock.AppCapabilities{}
+	capabilityProvider.On("Capabilities").Return(appCapability)
+	appCapability.On("StorePvtDataOfInvalidTx").Return(true)
+	coordinator := NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    cs,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, store.store, peerSelfSignedData, metrics, testConfig, idDeserializerFactory)
+	err = coordinator.StoreBlock(block, pvtData)
+	require.NoError(t, err)
 	assertCommitHappened()
 	assertPurged("tx1")
 }
@@ -1192,185 +1502,297 @@ func TestProceedWithoutPrivateData(t *testing.T) {
 func TestProceedWithInEligiblePrivateData(t *testing.T) {
 	// Scenario: we are missing private data (c2 in ns3) and it cannot be obtained from any peer.
 	// Block needs to be committed with missing private data.
+	err := msptesttools.LoadMSPSetupForTesting()
+	require.NoError(t, err, fmt.Sprintf("Failed to setup local msp for testing, got err %s", err))
+	identity := mspmgmt.GetLocalSigningIdentityOrPanic(factory.GetDefault())
+	serializedID, err := identity.Serialize()
+	require.NoError(t, err, fmt.Sprintf("Serialize should have succeeded, got err %s", err))
+	data := []byte{1, 2, 3}
+	signature, err := identity.Sign(data)
+	require.NoError(t, err, fmt.Sprintf("Could not sign identity, got err %s", err))
+	mspID := "Org1MSP"
 	peerSelfSignedData := protoutil.SignedData{
-		Identity:  []byte{0, 1, 2},
-		Signature: []byte{3, 4, 5},
-		Data:      []byte{6, 7, 8},
+		Identity:  serializedID,
+		Signature: signature,
+		Data:      data,
 	}
 
-	cs := createcollectionStore(peerSelfSignedData).thatAcceptsNone()
+	cs := createcollectionStore(peerSelfSignedData).thatAcceptsNone().withMSPIdentity(identity.GetMSPIdentifier())
 
 	var commitHappened bool
 	assertCommitHappened := func() {
-		assert.True(t, commitHappened)
+		require.True(t, commitHappened)
 		commitHappened = false
 	}
 	committer := &mocks.Committer{}
-	committer.On("CommitWithPvtData", mock.Anything).Run(func(args mock.Arguments) {
+	committer.On("CommitLegacy", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 		blockAndPrivateData := args.Get(0).(*ledger.BlockAndPvtData)
 		privateDataPassed2Ledger := blockAndPrivateData.PvtData
-		assert.True(t, reflect.DeepEqual(flattenTxPvtDataMap(privateDataPassed2Ledger),
+		require.True(t, reflect.DeepEqual(flattenTxPvtDataMap(privateDataPassed2Ledger),
 			flattenTxPvtDataMap(expectedCommittedPrivateData3)))
 		missingPrivateData := blockAndPrivateData.MissingPvtData
 		expectedMissingPvtData := make(ledger.TxMissingPvtDataMap)
 		expectedMissingPvtData.Add(0, "ns3", "c2", false)
-		assert.Equal(t, expectedMissingPvtData, missingPrivateData)
+		require.Equal(t, expectedMissingPvtData, missingPrivateData)
 		commitHappened = true
+
+		commitOpts := args.Get(1).(*ledger.CommitOptions)
+		expectedCommitOpts := &ledger.CommitOptions{FetchPvtDataFromLedger: false}
+		require.Equal(t, expectedCommitOpts, commitOpts)
 	}).Return(nil)
 
 	hash := util2.ComputeSHA256([]byte("rws-pre-image"))
 	bf := &blockFactory{
-		channelID: "test",
+		channelID: "testchannelid",
 	}
 
+	idDeserializerFactory := IdentityDeserializerFactoryFunc(func(chainID string) msp.IdentityDeserializer {
+		return mgmt.GetManagerForChain("testchannelid")
+	})
+
 	block := bf.AddTxn("tx1", "ns3", hash, "c2").create()
+	committer.On("DoesPvtDataInfoExistInLedger", mock.Anything).Return(false, nil)
 
 	metrics := metrics.NewGossipMetrics(&disabled.Provider{}).PrivdataMetrics
 
-	coordinator := NewCoordinator(Support{
-		CollectionStore: cs,
-		Committer:       committer,
-		Fetcher:         nil,
-		TransientStore:  nil,
-		Validator:       &validatorMock{},
-	}, peerSelfSignedData, metrics, testConfig)
-	err := coordinator.StoreBlock(block, nil)
-	assert.NoError(t, err)
+	capabilityProvider := &capabilitymock.CapabilityProvider{}
+	appCapability := &capabilitymock.AppCapabilities{}
+	capabilityProvider.On("Capabilities").Return(appCapability)
+	appCapability.On("StorePvtDataOfInvalidTx").Return(true)
+	coordinator := NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    cs,
+		Committer:          committer,
+		Fetcher:            nil,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, nil, peerSelfSignedData, metrics, testConfig, idDeserializerFactory)
+	err = coordinator.StoreBlock(block, nil)
+	require.NoError(t, err)
 	assertCommitHappened()
 }
 
 func TestCoordinatorGetBlocks(t *testing.T) {
 	metrics := metrics.NewGossipMetrics(&disabled.Provider{}).PrivdataMetrics
-	sd := protoutil.SignedData{
-		Identity:  []byte{0, 1, 2},
-		Signature: []byte{3, 4, 5},
-		Data:      []byte{6, 7, 8},
+	err := msptesttools.LoadMSPSetupForTesting()
+	require.NoError(t, err, fmt.Sprintf("Failed to setup local msp for testing, got err %s", err))
+	identity := mspmgmt.GetLocalSigningIdentityOrPanic(factory.GetDefault())
+	serializedID, err := identity.Serialize()
+	require.NoError(t, err, fmt.Sprintf("Serialize should have succeeded, got err %s", err))
+	data := []byte{1, 2, 3}
+	signature, err := identity.Sign(data)
+	require.NoError(t, err, fmt.Sprintf("Could not sign identity, got err %s", err))
+	mspID := "Org1MSP"
+	peerSelfSignedData := protoutil.SignedData{
+		Identity:  serializedID,
+		Signature: signature,
+		Data:      data,
 	}
-	cs := createcollectionStore(sd).thatAcceptsAll()
-	committer := &mocks.Committer{}
-	store := &mockTransientStore{t: t}
+
+	store := newTransientStore(t)
+	defer store.tearDown()
+
+	idDeserializerFactory := IdentityDeserializerFactoryFunc(func(chainID string) msp.IdentityDeserializer {
+		return mgmt.GetManagerForChain("testchannelid")
+	})
+
 	fetcher := &fetcherMock{t: t}
-	coordinator := NewCoordinator(Support{
-		CollectionStore: cs,
-		Committer:       committer,
-		Fetcher:         fetcher,
-		TransientStore:  store,
-		Validator:       &validatorMock{},
-	}, sd, metrics, testConfig)
+
+	committer := &mocks.Committer{}
+	committer.On("DoesPvtDataInfoExistInLedger", mock.Anything).Return(false, nil)
+
+	capabilityProvider := &capabilitymock.CapabilityProvider{}
+	appCapability := &capabilitymock.AppCapabilities{}
+	capabilityProvider.On("Capabilities").Return(appCapability)
+	appCapability.On("StorePvtDataOfInvalidTx").Return(true)
 
 	hash := util2.ComputeSHA256([]byte("rws-pre-image"))
 	bf := &blockFactory{
-		channelID: "test",
+		channelID: "testchannelid",
 	}
 	block := bf.AddTxn("tx1", "ns1", hash, "c1", "c2").AddTxn("tx2", "ns2", hash, "c1").create()
 
 	// Green path - block and private data is returned, but the requester isn't eligible for all the private data,
 	// but only to a subset of it.
-	cs = createcollectionStore(sd).thatAccepts(CollectionCriteria{
+	cs := createcollectionStore(peerSelfSignedData).thatAccepts(CollectionCriteria{
 		Namespace:  "ns1",
 		Collection: "c2",
-		TxId:       "tx1",
-		Channel:    "test",
-	})
+		Channel:    "testchannelid",
+	}).withMSPIdentity(identity.GetMSPIdentifier())
 	committer.Mock = mock.Mock{}
 	committer.On("GetPvtDataAndBlockByNum", mock.Anything).Return(&ledger.BlockAndPvtData{
 		Block:   block,
 		PvtData: expectedCommittedPrivateData1,
 	}, nil)
-	coordinator = NewCoordinator(Support{
-		CollectionStore: cs,
-		Committer:       committer,
-		Fetcher:         fetcher,
-		TransientStore:  store,
-		Validator:       &validatorMock{},
-	}, sd, metrics, testConfig)
+	committer.On("DoesPvtDataInfoExistInLedger", mock.Anything).Return(false, nil)
+	coordinator := NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    cs,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, store.store, peerSelfSignedData, metrics, testConfig, idDeserializerFactory)
 	expectedPrivData := (&pvtDataFactory{}).addRWSet().addNSRWSet("ns1", "c2").create()
-	block2, returnedPrivateData, err := coordinator.GetPvtDataAndBlockByNum(1, sd)
-	assert.NoError(t, err)
-	assert.Equal(t, block, block2)
-	assert.Equal(t, expectedPrivData, []*ledger.TxPvtData(returnedPrivateData))
+	block2, returnedPrivateData, err := coordinator.GetPvtDataAndBlockByNum(1, peerSelfSignedData)
+	require.NoError(t, err)
+	require.Equal(t, block, block2)
+	require.Equal(t, expectedPrivData, []*ledger.TxPvtData(returnedPrivateData))
 
 	// Bad path - error occurs when trying to retrieve the block and private data
 	committer.Mock = mock.Mock{}
 	committer.On("GetPvtDataAndBlockByNum", mock.Anything).Return(nil, errors.New("uh oh"))
-	block2, returnedPrivateData, err = coordinator.GetPvtDataAndBlockByNum(1, sd)
-	assert.Nil(t, block2)
-	assert.Empty(t, returnedPrivateData)
-	assert.Error(t, err)
+	block2, returnedPrivateData, err = coordinator.GetPvtDataAndBlockByNum(1, peerSelfSignedData)
+	require.Nil(t, block2)
+	require.Empty(t, returnedPrivateData)
+	require.Error(t, err)
 }
 
-func TestPurgeByHeight(t *testing.T) {
-	// Scenario: commit 3000 blocks and ensure that PurgeByHeight is called
-	// at commit of blocks 2000 and 3000 with values of max block to retain of 1000 and 2000
+func TestPurgeBelowHeight(t *testing.T) {
+	conf := testConfig
+	conf.TransientBlockRetention = 5
+	mspID := "Org1MSP"
 	peerSelfSignedData := protoutil.SignedData{}
 	cs := createcollectionStore(peerSelfSignedData).thatAcceptsAll()
 
-	var purgeHappened bool
-	assertPurgeHappened := func() {
-		assert.True(t, purgeHappened)
-		purgeHappened = false
-	}
 	committer := &mocks.Committer{}
-	committer.On("CommitWithPvtData", mock.Anything).Return(nil)
-	store := &mockTransientStore{t: t}
-	store.On("PurgeByHeight", uint64(1000)).Return(nil).Once().Run(func(_ mock.Arguments) {
-		purgeHappened = true
-	})
-	store.On("PurgeByHeight", uint64(2000)).Return(nil).Once().Run(func(_ mock.Arguments) {
-		purgeHappened = true
-	})
-	store.On("PurgeByTxids", mock.Anything).Return(nil)
+	committer.On("CommitLegacy", mock.Anything, mock.Anything).Return(nil)
+
+	store := newTransientStore(t)
+	defer store.tearDown()
+
+	// store 9 data sets initially
+	for i := 0; i < 9; i++ {
+		txID := fmt.Sprintf("tx%d", i+1)
+		store.Persist(txID, uint64(i), &tspb.TxPvtReadWriteSetWithConfigInfo{
+			PvtRwset: &rwset.TxPvtReadWriteSet{
+				NsPvtRwset: []*rwset.NsPvtReadWriteSet{
+					{
+						Namespace: "ns1",
+						CollectionPvtRwset: []*rwset.CollectionPvtReadWriteSet{
+							{
+								CollectionName: "c1",
+								Rwset:          []byte("rws-pre-image"),
+							},
+						},
+					},
+				},
+			},
+			CollectionConfigs: make(map[string]*peer.CollectionConfigPackage),
+		})
+	}
+	assertPurged := func(purged bool) bool {
+		numTx := 9
+		if purged {
+			numTx = 10
+		}
+		for i := 1; i <= numTx; i++ {
+			txID := fmt.Sprintf("tx%d", i)
+			iterator, err := store.GetTxPvtRWSetByTxid(txID, nil)
+			if err != nil {
+				iterator.Close()
+				t.Fatalf("Failed iterating, got err %s", err)
+			}
+			res, err := iterator.Next()
+			iterator.Close()
+			if err != nil {
+				t.Fatalf("Failed iterating, got err %s", err)
+			}
+			if (i < 6 || i == numTx) && purged {
+				if res != nil {
+					return false
+				}
+				continue
+			}
+			if res == nil {
+				return false
+			}
+		}
+		return true
+	}
+
 	fetcher := &fetcherMock{t: t}
 
 	bf := &blockFactory{
-		channelID: "test",
+		channelID: "testchannelid",
 	}
+
+	idDeserializerFactory := IdentityDeserializerFactoryFunc(func(chainID string) msp.IdentityDeserializer {
+		return mgmt.GetManagerForChain("testchannelid")
+	})
+
+	pdFactory := &pvtDataFactory{}
+
+	committer.On("DoesPvtDataInfoExistInLedger", mock.Anything).Return(false, nil)
 
 	metrics := metrics.NewGossipMetrics(&disabled.Provider{}).PrivdataMetrics
 
-	coordinator := NewCoordinator(Support{
-		CollectionStore: cs,
-		Committer:       committer,
-		Fetcher:         fetcher,
-		TransientStore:  store,
-		Validator:       &validatorMock{},
-	}, peerSelfSignedData, metrics, testConfig)
+	capabilityProvider := &capabilitymock.CapabilityProvider{}
+	appCapability := &capabilitymock.AppCapabilities{}
+	capabilityProvider.On("Capabilities").Return(appCapability)
+	appCapability.On("StorePvtDataOfInvalidTx").Return(true)
+	coordinator := NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    cs,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, store.store, peerSelfSignedData, metrics, conf, idDeserializerFactory)
 
-	for i := 0; i <= 3000; i++ {
-		block := bf.create()
-		block.Header.Number = uint64(i)
-		err := coordinator.StoreBlock(block, nil)
-		assert.NoError(t, err)
-		if i != 2000 && i != 3000 {
-			assert.False(t, purgeHappened)
-		} else {
-			assertPurgeHappened()
-		}
+	hash := util2.ComputeSHA256([]byte("rws-pre-image"))
+	block := bf.AddTxn("tx10", "ns1", hash, "c1").create()
+	block.Header.Number = 10
+	pvtData := pdFactory.addRWSet().addNSRWSet("ns1", "c1").create()
+	// test no blocks purged yet
+	assertPurgedBlocks := func() bool {
+		return assertPurged(false)
 	}
+	require.Eventually(t, assertPurgedBlocks, 2*time.Second, 100*time.Millisecond)
+	err := coordinator.StoreBlock(block, pvtData)
+	require.NoError(t, err)
+	// test first 6 blocks were purged
+	assertPurgedBlocks = func() bool {
+		return assertPurged(true)
+	}
+	require.Eventually(t, assertPurgedBlocks, 2*time.Second, 100*time.Millisecond)
 }
 
 func TestCoordinatorStorePvtData(t *testing.T) {
+	mspID := "Org1MSP"
 	metrics := metrics.NewGossipMetrics(&disabled.Provider{}).PrivdataMetrics
 	cs := createcollectionStore(protoutil.SignedData{}).thatAcceptsAll()
 	committer := &mocks.Committer{}
-	store := &mockTransientStore{t: t}
-	store.On("PersistWithConfig", mock.Anything, uint64(5), mock.Anything).
-		expectRWSet("ns1", "c1", []byte("rws-pre-image")).Return(nil)
+
+	store := newTransientStore(t)
+	defer store.tearDown()
+
+	idDeserializerFactory := IdentityDeserializerFactoryFunc(func(chainID string) msp.IdentityDeserializer {
+		return mgmt.GetManagerForChain("testchannelid")
+	})
+
 	fetcher := &fetcherMock{t: t}
-	coordinator := NewCoordinator(Support{
-		CollectionStore: cs,
-		Committer:       committer,
-		Fetcher:         fetcher,
-		TransientStore:  store,
-		Validator:       &validatorMock{},
-	}, protoutil.SignedData{}, metrics, testConfig)
+	committer.On("DoesPvtDataInfoExistInLedger", mock.Anything).Return(false, nil)
+
+	capabilityProvider := &capabilitymock.CapabilityProvider{}
+	appCapability := &capabilitymock.AppCapabilities{}
+	capabilityProvider.On("Capabilities").Return(appCapability)
+	appCapability.On("StorePvtDataOfInvalidTx").Return(true)
+	coordinator := NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    cs,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, store.store, protoutil.SignedData{}, metrics, testConfig, idDeserializerFactory)
 	pvtData := (&pvtDataFactory{}).addRWSet().addNSRWSet("ns1", "c1").create()
 	// Green path: ledger height can be retrieved from ledger/committer
-	err := coordinator.StorePvtData("tx1", &transientstore2.TxPvtReadWriteSetWithConfigInfo{
+	err := coordinator.StorePvtData("tx1", &tspb.TxPvtReadWriteSetWithConfigInfo{
 		PvtRwset:          pvtData[0].WriteSet,
-		CollectionConfigs: make(map[string]*common.CollectionConfigPackage),
+		CollectionConfigs: make(map[string]*peer.CollectionConfigPackage),
 	}, uint64(5))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestContainsWrites(t *testing.T) {
@@ -1378,15 +1800,15 @@ func TestContainsWrites(t *testing.T) {
 	col := &rwsetutil.CollHashedRwSet{
 		CollectionName: "col1",
 	}
-	assert.False(t, containsWrites("tx", "ns", col))
+	require.False(t, containsWrites("tx", "ns", col))
 
 	// Scenario II: No writes in collection
 	col.HashedRwSet = &kvrwset.HashedRWSet{}
-	assert.False(t, containsWrites("tx", "ns", col))
+	require.False(t, containsWrites("tx", "ns", col))
 
 	// Scenario III: Some writes in collection
 	col.HashedRwSet.HashedWrites = append(col.HashedRwSet.HashedWrites, &kvrwset.KVWriteHash{})
-	assert.True(t, containsWrites("tx", "ns", col))
+	require.True(t, containsWrites("tx", "ns", col))
 }
 
 func TestIgnoreReadOnlyColRWSets(t *testing.T) {
@@ -1398,114 +1820,187 @@ func TestIgnoreReadOnlyColRWSets(t *testing.T) {
 	// transient store or other peers, the test would fail.
 	// Also - we check that at commit time - the coordinator concluded that
 	// no missing private data was found.
+	err := msptesttools.LoadMSPSetupForTesting()
+	require.NoError(t, err, fmt.Sprintf("Failed to setup local msp for testing, got err %s", err))
+	identity := mspmgmt.GetLocalSigningIdentityOrPanic(factory.GetDefault())
+	serializedID, err := identity.Serialize()
+	require.NoError(t, err, fmt.Sprintf("Serialize should have succeeded, got err %s", err))
+	data := []byte{1, 2, 3}
+	signature, err := identity.Sign(data)
+	require.NoError(t, err, fmt.Sprintf("Could not sign identity, got err %s", err))
+	mspID := "Org1MSP"
 	peerSelfSignedData := protoutil.SignedData{
-		Identity:  []byte{0, 1, 2},
-		Signature: []byte{3, 4, 5},
-		Data:      []byte{6, 7, 8},
+		Identity:  serializedID,
+		Signature: signature,
+		Data:      data,
 	}
-	cs := createcollectionStore(peerSelfSignedData).thatAcceptsAll()
+	cs := createcollectionStore(peerSelfSignedData).thatAcceptsAll().withMSPIdentity(identity.GetMSPIdentifier())
 	var commitHappened bool
 	assertCommitHappened := func() {
-		assert.True(t, commitHappened)
+		require.True(t, commitHappened)
 		commitHappened = false
 	}
 	committer := &mocks.Committer{}
-	committer.On("CommitWithPvtData", mock.Anything).Run(func(args mock.Arguments) {
+	committer.On("CommitLegacy", mock.Anything, mock.Anything).Run(func(args mock.Arguments) {
 		blockAndPrivateData := args.Get(0).(*ledger.BlockAndPvtData)
 		// Ensure there is no private data to commit
-		assert.Empty(t, blockAndPrivateData.PvtData)
+		require.Empty(t, blockAndPrivateData.PvtData)
 		// Ensure there is no missing private data
-		assert.Empty(t, blockAndPrivateData.MissingPvtData)
+		require.Empty(t, blockAndPrivateData.MissingPvtData)
 		commitHappened = true
+
+		commitOpts := args.Get(1).(*ledger.CommitOptions)
+		expectedCommitOpts := &ledger.CommitOptions{FetchPvtDataFromLedger: false}
+		require.Equal(t, expectedCommitOpts, commitOpts)
 	}).Return(nil)
-	store := &mockTransientStore{t: t}
+
+	store := newTransientStore(t)
+	defer store.tearDown()
 
 	fetcher := &fetcherMock{t: t}
 	hash := util2.ComputeSHA256([]byte("rws-pre-image"))
 	bf := &blockFactory{
-		channelID: "test",
+		channelID: "testchannelid",
 	}
+
+	idDeserializerFactory := IdentityDeserializerFactoryFunc(func(chainID string) msp.IdentityDeserializer {
+		return mgmt.GetManagerForChain("testchannelid")
+	})
+
 	// The block contains a read only private data transaction
 	block := bf.AddReadOnlyTxn("tx1", "ns3", hash, "c3", "c2").create()
+	committer.On("DoesPvtDataInfoExistInLedger", mock.Anything).Return(false, nil)
 	metrics := metrics.NewGossipMetrics(&disabled.Provider{}).PrivdataMetrics
-	coordinator := NewCoordinator(Support{
-		CollectionStore: cs,
-		Committer:       committer,
-		Fetcher:         fetcher,
-		TransientStore:  store,
-		Validator:       &validatorMock{},
-	}, peerSelfSignedData, metrics, testConfig)
+
+	capabilityProvider := &capabilitymock.CapabilityProvider{}
+	appCapability := &capabilitymock.AppCapabilities{}
+	capabilityProvider.On("Capabilities").Return(appCapability)
+	appCapability.On("StorePvtDataOfInvalidTx").Return(true)
+	coordinator := NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    cs,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, store.store, peerSelfSignedData, metrics, testConfig, idDeserializerFactory)
 	// We pass a nil private data slice to indicate no pre-images though the block contains
 	// private data reads.
-	err := coordinator.StoreBlock(block, nil)
-	assert.NoError(t, err)
+	err = coordinator.StoreBlock(block, nil)
+	require.NoError(t, err)
 	assertCommitHappened()
 }
 
 func TestCoordinatorMetrics(t *testing.T) {
+	err := msptesttools.LoadMSPSetupForTesting()
+	require.NoError(t, err, fmt.Sprintf("Failed to setup local msp for testing, got err %s", err))
+	identity := mspmgmt.GetLocalSigningIdentityOrPanic(factory.GetDefault())
+	serializedID, err := identity.Serialize()
+	require.NoError(t, err, fmt.Sprintf("Serialize should have succeeded, got err %s", err))
+	data := []byte{1, 2, 3}
+	signature, err := identity.Sign(data)
+	require.NoError(t, err, fmt.Sprintf("Could not sign identity, got err %s", err))
+	mspID := "Org1MSP"
 	peerSelfSignedData := protoutil.SignedData{
-		Identity:  []byte{0, 1, 2},
-		Signature: []byte{3, 4, 5},
-		Data:      []byte{6, 7, 8},
+		Identity:  serializedID,
+		Signature: signature,
+		Data:      data,
 	}
 
-	cs := createcollectionStore(peerSelfSignedData).thatAcceptsAll()
+	cs := createcollectionStore(peerSelfSignedData).thatAcceptsAll().withMSPIdentity(identity.GetMSPIdentifier())
 
 	committer := &mocks.Committer{}
-	committer.On("CommitWithPvtData", mock.Anything).Return(nil)
+	committer.On("CommitLegacy", mock.Anything, mock.Anything).Return(nil)
 
-	store := &mockTransientStore{t: t}
-	store.On("PurgeByTxids", mock.Anything).Return(nil)
+	store := newTransientStore(t)
+	defer store.tearDown()
 
 	hash := util2.ComputeSHA256([]byte("rws-pre-image"))
 	pdFactory := &pvtDataFactory{}
 	bf := &blockFactory{
-		channelID: "test",
+		channelID: "testchannelid",
 	}
+
+	idDeserializerFactory := IdentityDeserializerFactoryFunc(func(chainID string) msp.IdentityDeserializer {
+		return mgmt.GetManagerForChain("testchannelid")
+	})
+
 	block := bf.AddTxnWithEndorsement("tx1", "ns1", hash, "org1", true, "c1", "c2").
-		AddTxnWithEndorsement("tx2", "ns2", hash, "org2", true, "c1").create()
+		AddTxnWithEndorsement("tx2", "ns2", hash, "org2", true, "c1").
+		AddTxnWithEndorsement("tx3", "ns3", hash, "org3", true, "c1").create()
 
 	pvtData := pdFactory.addRWSet().addNSRWSet("ns1", "c1", "c2").addRWSet().addNSRWSet("ns2", "c1").create()
+	// fetch duration metric only reported when fetching from remote peer
+	fetcher := &fetcherMock{t: t}
+	fetcher.On("fetch", mock.Anything).expectingDigests([]privdatacommon.DigKey{
+		{
+			TxId: "tx3", Namespace: "ns3", Collection: "c1", BlockSeq: 1, SeqInBlock: 2,
+		},
+	}).Return(&privdatacommon.FetchedPvtDataContainer{
+		AvailableElements: []*proto.PvtDataElement{
+			{
+				Digest: &proto.PvtDataDigest{
+					SeqInBlock: 2,
+					BlockSeq:   1,
+					Collection: "c1",
+					Namespace:  "ns3",
+					TxId:       "tx3",
+				},
+				Payload: [][]byte{[]byte("rws-pre-image")},
+			},
+		},
+	}, nil)
 
 	testMetricProvider := gmetricsmocks.TestUtilConstructMetricProvider()
 	metrics := metrics.NewGossipMetrics(testMetricProvider.FakeProvider).PrivdataMetrics
 
-	coordinator := NewCoordinator(Support{
-		CollectionStore: cs,
-		Committer:       committer,
-		Fetcher:         &fetcherMock{t: t},
-		TransientStore:  store,
-		Validator:       &validatorMock{},
-		ChainID:         "test",
-	}, peerSelfSignedData, metrics, testConfig)
-	err := coordinator.StoreBlock(block, pvtData)
-	assert.NoError(t, err)
+	committer.On("DoesPvtDataInfoExistInLedger", mock.Anything).Return(false, nil)
+
+	capabilityProvider := &capabilitymock.CapabilityProvider{}
+	appCapability := &capabilitymock.AppCapabilities{}
+	capabilityProvider.On("Capabilities").Return(appCapability)
+	appCapability.On("StorePvtDataOfInvalidTx").Return(true)
+	coordinator := NewCoordinator(mspID, Support{
+		ChainID:            "testchannelid",
+		CollectionStore:    cs,
+		Committer:          committer,
+		Fetcher:            fetcher,
+		Validator:          &validatorMock{},
+		CapabilityProvider: capabilityProvider,
+	}, store.store, peerSelfSignedData, metrics, testConfig, idDeserializerFactory)
+	err = coordinator.StoreBlock(block, pvtData)
+	require.NoError(t, err)
 
 	// make sure all coordinator metrics were reported
 
-	assert.Equal(t,
-		[]string{"channel", "test"},
+	require.Equal(t,
+		[]string{"channel", "testchannelid"},
 		testMetricProvider.FakeValidationDuration.WithArgsForCall(0),
 	)
-	assert.True(t, testMetricProvider.FakeValidationDuration.ObserveArgsForCall(0) > 0)
-	assert.Equal(t,
-		[]string{"channel", "test"},
+	require.True(t, testMetricProvider.FakeValidationDuration.ObserveArgsForCall(0) > 0)
+	require.Equal(t,
+		[]string{"channel", "testchannelid"},
 		testMetricProvider.FakeListMissingPrivateDataDuration.WithArgsForCall(0),
 	)
-	assert.True(t, testMetricProvider.FakeListMissingPrivateDataDuration.ObserveArgsForCall(0) > 0)
-	assert.Equal(t,
-		[]string{"channel", "test"},
+	require.True(t, testMetricProvider.FakeListMissingPrivateDataDuration.ObserveArgsForCall(0) > 0)
+	require.Equal(t,
+		[]string{"channel", "testchannelid"},
 		testMetricProvider.FakeFetchDuration.WithArgsForCall(0),
 	)
-	assert.True(t, testMetricProvider.FakeFetchDuration.ObserveArgsForCall(0) > 0)
-	assert.Equal(t,
-		[]string{"channel", "test"},
+	// fetch duration metric only reported when fetching from remote peer
+	require.True(t, testMetricProvider.FakeFetchDuration.ObserveArgsForCall(0) > 0)
+	require.Equal(t,
+		[]string{"channel", "testchannelid"},
 		testMetricProvider.FakeCommitPrivateDataDuration.WithArgsForCall(0),
 	)
-	assert.True(t, testMetricProvider.FakeCommitPrivateDataDuration.ObserveArgsForCall(0) > 0)
-	assert.Equal(t,
-		[]string{"channel", "test"},
+	require.True(t, testMetricProvider.FakeCommitPrivateDataDuration.ObserveArgsForCall(0) > 0)
+	require.Equal(t,
+		[]string{"channel", "testchannelid"},
 		testMetricProvider.FakePurgeDuration.WithArgsForCall(0),
 	)
-	assert.True(t, testMetricProvider.FakePurgeDuration.ObserveArgsForCall(0) > 0)
+
+	purgeDuration := func() bool {
+		return testMetricProvider.FakePurgeDuration.ObserveArgsForCall(0) > 0
+	}
+	require.Eventually(t, purgeDuration, 2*time.Second, 100*time.Millisecond)
 }

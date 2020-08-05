@@ -17,7 +17,6 @@ peer:
   addressAutoDetect: true
   listenAddress: 127.0.0.1:{{ .PeerPort Peer "Listen" }}
   chaincodeListenAddress: 0.0.0.0:{{ .PeerPort Peer "Chaincode" }}
-  gomaxprocs: -1
   keepalive:
     minInterval: 60s
     client:
@@ -28,10 +27,12 @@ peer:
       timeout: 20s
   gossip:
     bootstrap: 127.0.0.1:{{ .PeerPort Peer "Listen" }}
-    useLeaderElection: true
-    orgLeader: false
-    endpoint:
-    maxBlockCountToStore: 100
+    endpoint: 127.0.0.1:{{ .PeerPort Peer "Listen" }}
+    externalEndpoint: 127.0.0.1:{{ .PeerPort Peer "Listen" }}
+    useLeaderElection: false
+    orgLeader: true
+    membershipTrackerInterval: 5s
+    maxBlockCountToStore: 10
     maxPropagationBurstLatency: 10ms
     maxPropagationBurstSize: 10
     propagateIterations: 1
@@ -52,19 +53,30 @@ peer:
     aliveTimeInterval: 5s
     aliveExpirationTimeout: 25s
     reconnectInterval: 25s
-    externalEndpoint: 127.0.0.1:{{ .PeerPort Peer "Listen" }}
     election:
       startupGracePeriod: 15s
       membershipSampleInterval: 1s
       leaderAliveThreshold: 10s
       leaderElectionDuration: 5s
     pvtData:
-      pullRetryThreshold: 15s
+      pullRetryThreshold: 7s
       transientstoreMaxBlockRetention: 1000
       pushAckTimeout: 3s
+      btlPullMargin: 10
       reconcileBatchSize: 10
       reconcileSleepInterval: 10s
       reconciliationEnabled: true
+      skipPullingInvalidTransactionsDuringCommit: false
+      implicitCollectionDisseminationPolicy:
+        requiredPeerCount: 0
+        maxPeerCount: 1
+    state:
+       enabled: false
+       checkInterval: 10s
+       responseTimeout: 3s
+       batchSize: 10
+       blockBufferSize: 20
+       maxRetries: 3
   events:
     address: 127.0.0.1:{{ .PeerPort Peer "Events" }}
     buffersize: 100
@@ -74,10 +86,14 @@ peer:
       minInterval: 60s
   tls:
     enabled:  true
-    clientAuthRequired: false
+    clientAuthRequired: {{ .ClientAuthRequired }}
     cert:
       file: {{ .PeerLocalTLSDir Peer }}/server.crt
     key:
+      file: {{ .PeerLocalTLSDir Peer }}/server.key
+    clientCert:
+      file: {{ .PeerLocalTLSDir Peer }}/server.crt
+    clientKey:
       file: {{ .PeerLocalTLSDir Peer }}/server.key
     rootcert:
       file: {{ .PeerLocalTLSDir Peer }}/ca.crt
@@ -123,7 +139,8 @@ peer:
     orgMembersAllowedAccess: false
   limits:
     concurrency:
-      qscc: 500
+      endorserService: 100
+      deliverService: 100
 
 vm:
   endpoint: unix:///var/run/docker.sock
@@ -152,12 +169,11 @@ chaincode:
   golang:
     runtime: $(DOCKER_NS)/fabric-baseos:$(PROJECT_VERSION)
     dynamicLink: false
-  car:
-    runtime: $(DOCKER_NS)/fabric-baseos:$(PROJECT_VERSION)
   java:
     runtime: $(DOCKER_NS)/fabric-javaenv:latest
   node:
     runtime: $(DOCKER_NS)/fabric-nodeenv:latest
+  installTimeout: 300s
   startuptimeout: 300s
   executetimeout: 30s
   mode: net
@@ -167,11 +183,17 @@ chaincode:
     cscc:       enable
     lscc:       enable
     qscc:       enable
-  systemPlugins:
   logging:
     level:  info
     shim:   warning
     format: '%{color}%{time:2006-01-02 15:04:05.000 MST} [%{module}] %{shortfunc} -> %{level:.4s} %{id:03x}%{color:reset} %{message}'
+  externalBuilders: {{ range .ExternalBuilders }}
+    - path: {{ .Path }}
+      name: {{ .Name }}
+      propagateEnvironment: {{ range .PropagateEnvironment }}
+         - {{ . }}
+      {{- end }}
+  {{- end }}
 
 ledger:
   blockchain:
@@ -198,15 +220,20 @@ operations:
       file: {{ .PeerLocalTLSDir Peer }}/server.crt
     key:
       file: {{ .PeerLocalTLSDir Peer }}/server.key
-    clientAuthRequired: false
+    clientAuthRequired: {{ .ClientAuthRequired }}
     clientRootCAs:
       files:
       - {{ .PeerLocalTLSDir Peer }}/ca.crt
 metrics:
   provider: {{ .MetricsProvider }}
   statsd:
+    {{- if .StatsdEndpoint }}
+    network: tcp
+    address: {{ .StatsdEndpoint }}
+    {{- else }}
     network: udp
-    address: {{ if .StatsdEndpoint }}{{ .StatsdEndpoint }}{{ else }}127.0.0.1:8125{{ end }}
+    address: 127.0.0.1:8125
+    {{- end }}
     writeInterval: 5s
     prefix: {{ ReplaceAll (ToLower Peer.ID) "." "_" }}
 `

@@ -7,8 +7,8 @@ SPDX-License-Identifier: Apache-2.0
 package common
 
 import (
-	cb "github.com/hyperledger/fabric/protos/common"
-	ab "github.com/hyperledger/fabric/protos/orderer"
+	cb "github.com/hyperledger/fabric-protos-go/common"
+	ab "github.com/hyperledger/fabric-protos-go/orderer"
 	"github.com/pkg/errors"
 )
 
@@ -50,7 +50,7 @@ func (s *BroadcastGRPCClient) getAck() error {
 //Send data to orderer
 func (s *BroadcastGRPCClient) Send(env *cb.Envelope) error {
 	if err := s.Client.Send(env); err != nil {
-		return errors.WithMessage(err, "could not send")
+		return errors.WithMessage(err, "could not send to orderer node")
 	}
 
 	err := s.getAck()

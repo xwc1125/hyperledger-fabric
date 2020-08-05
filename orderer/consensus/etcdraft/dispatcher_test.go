@@ -9,12 +9,12 @@ package etcdraft_test
 import (
 	"testing"
 
+	"github.com/hyperledger/fabric-protos-go/orderer"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/orderer/consensus/etcdraft"
 	"github.com/hyperledger/fabric/orderer/consensus/etcdraft/mocks"
-	"github.com/hyperledger/fabric/protos/orderer"
 	"github.com/pkg/errors"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDispatchConsensus(t *testing.T) {
@@ -33,12 +33,12 @@ func TestDispatchConsensus(t *testing.T) {
 
 	t.Run("Channel exists", func(t *testing.T) {
 		err := disp.OnConsensus("mychannel", 1, expectedRequest)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 
 	t.Run("Channel does not exist", func(t *testing.T) {
 		err := disp.OnConsensus("notmychannel", 1, expectedRequest)
-		assert.EqualError(t, err, "channel notmychannel doesn't exist")
+		require.EqualError(t, err, "channel notmychannel doesn't exist")
 	})
 }
 
@@ -63,11 +63,11 @@ func TestDispatchSubmit(t *testing.T) {
 
 	t.Run("Channel exists", func(t *testing.T) {
 		err := disp.OnSubmit("mychannel", 1, expectedRequest)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 
 	t.Run("Channel does not exist", func(t *testing.T) {
 		err := disp.OnSubmit("notmychannel", 1, expectedRequest)
-		assert.EqualError(t, err, "channel notmychannel doesn't exist")
+		require.EqualError(t, err, "channel notmychannel doesn't exist")
 	})
 }

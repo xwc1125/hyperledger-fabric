@@ -1,5 +1,6 @@
 /*
 Copyright IBM Corp. All Rights Reserved.
+
 SPDX-License-Identifier: Apache-2.0
 */
 
@@ -10,8 +11,8 @@ import (
 	"encoding/gob"
 
 	"github.com/hyperledger/fabric/common/ledger/util/leveldbhelper"
+	"github.com/hyperledger/fabric/core/ledger/internal/version"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/statedb"
-	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/version"
 )
 
 var redologKeyPrefix = []byte{byte(0)}
@@ -29,9 +30,12 @@ type redoRecord struct {
 	Version     *version.Height
 }
 
-func newRedoLoggerProvider(dirPath string) *redoLoggerProvider {
-	provider := leveldbhelper.NewProvider(&leveldbhelper.Conf{DBPath: dirPath})
-	return &redoLoggerProvider{leveldbProvider: provider}
+func newRedoLoggerProvider(dirPath string) (*redoLoggerProvider, error) {
+	provider, err := leveldbhelper.NewProvider(&leveldbhelper.Conf{DBPath: dirPath})
+	if err != nil {
+		return nil, err
+	}
+	return &redoLoggerProvider{leveldbProvider: provider}, nil
 }
 
 func (p *redoLoggerProvider) newRedoLogger(dbName string) *redoLogger {

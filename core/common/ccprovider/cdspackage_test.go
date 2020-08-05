@@ -12,9 +12,10 @@ import (
 	"os"
 	"testing"
 
-	pb "github.com/hyperledger/fabric/protos/peer"
+	pb "github.com/hyperledger/fabric-protos-go/peer"
+	"github.com/hyperledger/fabric/bccsp/sw"
 	"github.com/hyperledger/fabric/protoutil"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func setupccdir() string {
@@ -29,7 +30,11 @@ func setupccdir() string {
 func processCDS(cds *pb.ChaincodeDeploymentSpec, tofs bool) (*CDSPackage, []byte, *ChaincodeData, error) {
 	b := protoutil.MarshalOrPanic(cds)
 
-	ccpack := &CDSPackage{}
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("error creating bootBCCSP: %s", err)
+	}
+	ccpack := &CDSPackage{GetHasher: cryptoProvider}
 	cd, err := ccpack.InitFromBuffer(b)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("error owner creating package %s", err)
@@ -112,7 +117,10 @@ func TestCDSGetCCPackage(t *testing.T) {
 
 	b := protoutil.MarshalOrPanic(cds)
 
-	ccpack, err := GetCCPackage(b)
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+
+	ccpack, err := GetCCPackage(b, cryptoProvider)
 	if err != nil {
 		t.Fatalf("failed to get CDS CCPackage %s", err)
 		return
@@ -168,39 +176,43 @@ func TestCDSSwitchChaincodes(t *testing.T) {
 }
 
 func TestPutChaincodeToFSErrorPaths(t *testing.T) {
-	ccpack := &CDSPackage{}
-	err := ccpack.PutChaincodeToFS()
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "uninitialized package", "Unexpected error returned")
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+	ccpack := &CDSPackage{GetHasher: cryptoProvider}
+	err = ccpack.PutChaincodeToFS()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "uninitialized package", "Unexpected error returned")
 
 	ccpack.buf = []byte("hello")
 	err = ccpack.PutChaincodeToFS()
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "id cannot be nil if buf is not nil", "Unexpected error returned")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "id cannot be nil if buf is not nil", "Unexpected error returned")
 
 	ccpack.id = []byte("cc123")
 	err = ccpack.PutChaincodeToFS()
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "depspec cannot be nil if buf is not nil", "Unexpected error returned")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "depspec cannot be nil if buf is not nil", "Unexpected error returned")
 
 	ccpack.depSpec = &pb.ChaincodeDeploymentSpec{ChaincodeSpec: &pb.ChaincodeSpec{Type: 1, ChaincodeId: &pb.ChaincodeID{Name: "testcc", Version: "0"},
 		Input: &pb.ChaincodeInput{Args: [][]byte{[]byte("")}}}, CodePackage: []byte("code")}
 	err = ccpack.PutChaincodeToFS()
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "nil data", "Unexpected error returned")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "nil data", "Unexpected error returned")
 
 	ccpack.data = &CDSData{}
 	err = ccpack.PutChaincodeToFS()
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "nil data bytes", "Unexpected error returned")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "nil data bytes", "Unexpected error returned")
 }
 
 func TestValidateCCErrorPaths(t *testing.T) {
-	cpack := &CDSPackage{}
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+	cpack := &CDSPackage{GetHasher: cryptoProvider}
 	ccdata := &ChaincodeData{}
-	err := cpack.ValidateCC(ccdata)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "uninitialized package", "Unexpected error returned")
+	err = cpack.ValidateCC(ccdata)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "uninitialized package", "Unexpected error returned")
 
 	cpack.depSpec = &pb.ChaincodeDeploymentSpec{
 		CodePackage: []byte("code"),
@@ -211,11 +223,11 @@ func TestValidateCCErrorPaths(t *testing.T) {
 		},
 	}
 	err = cpack.ValidateCC(ccdata)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "nil data", "Unexpected error returned")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "nil data", "Unexpected error returned")
 
 	// invalid encoded name
-	cpack = &CDSPackage{}
+	cpack = &CDSPackage{GetHasher: cryptoProvider}
 	ccdata = &ChaincodeData{Name: "\027"}
 	cpack.depSpec = &pb.ChaincodeDeploymentSpec{
 		CodePackage: []byte("code"),
@@ -225,11 +237,11 @@ func TestValidateCCErrorPaths(t *testing.T) {
 	}
 	cpack.data = &CDSData{}
 	err = cpack.ValidateCC(ccdata)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), `invalid chaincode name: "\x17"`)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `invalid chaincode name: "\x17"`)
 
 	// mismatched names
-	cpack = &CDSPackage{}
+	cpack = &CDSPackage{GetHasher: cryptoProvider}
 	ccdata = &ChaincodeData{Name: "Tom"}
 	cpack.depSpec = &pb.ChaincodeDeploymentSpec{
 		CodePackage: []byte("code"),
@@ -239,11 +251,11 @@ func TestValidateCCErrorPaths(t *testing.T) {
 	}
 	cpack.data = &CDSData{}
 	err = cpack.ValidateCC(ccdata)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), `invalid chaincode data name:"Tom"  (name:"Jerry" version:"0" )`)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `invalid chaincode data name:"Tom"  (name:"Jerry" version:"0" )`)
 
 	// mismatched versions
-	cpack = &CDSPackage{}
+	cpack = &CDSPackage{GetHasher: cryptoProvider}
 	ccdata = &ChaincodeData{Name: "Tom", Version: "1"}
 	cpack.depSpec = &pb.ChaincodeDeploymentSpec{
 		CodePackage: []byte("code"),
@@ -253,6 +265,6 @@ func TestValidateCCErrorPaths(t *testing.T) {
 	}
 	cpack.data = &CDSData{}
 	err = cpack.ValidateCC(ccdata)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), `invalid chaincode data name:"Tom" version:"1"  (name:"Tom" version:"0" )`)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), `invalid chaincode data name:"Tom" version:"1"  (name:"Tom" version:"0" )`)
 }

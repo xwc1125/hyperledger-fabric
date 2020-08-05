@@ -8,30 +8,30 @@ package etcdraft
 
 import (
 	"bytes"
+	"github.com/hyperledger/fabric/common/channelconfig"
+	"github.com/hyperledger/fabric/protoutil"
 	"path"
 	"reflect"
 	"time"
 
 	"code.cloudfoundry.org/clock"
 	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric-protos-go/common"
+	"github.com/hyperledger/fabric-protos-go/orderer"
+	"github.com/hyperledger/fabric-protos-go/orderer/etcdraft"
+	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/metrics"
-	"github.com/hyperledger/fabric/core/comm"
+	"github.com/hyperledger/fabric/internal/pkg/comm"
 	"github.com/hyperledger/fabric/orderer/common/cluster"
 	"github.com/hyperledger/fabric/orderer/common/localconfig"
 	"github.com/hyperledger/fabric/orderer/common/multichannel"
 	"github.com/hyperledger/fabric/orderer/consensus"
 	"github.com/hyperledger/fabric/orderer/consensus/inactive"
-	"github.com/hyperledger/fabric/protos/common"
-	"github.com/hyperledger/fabric/protos/orderer"
-	"github.com/hyperledger/fabric/protos/orderer/etcdraft"
 	"github.com/mitchellh/mapstructure"
 	"github.com/pkg/errors"
 	"go.etcd.io/etcd/raft"
 )
-
-// CreateChainCallback creates a new chain
-type CreateChainCallback func()
 
 //go:generate mockery -dir . -name InactiveChainRegistry -case underscore -output mocks
 
@@ -39,7 +39,7 @@ type CreateChainCallback func()
 type InactiveChainRegistry interface {
 	// TrackChain tracks a chain with the given name, and calls the given callback
 	// when this chain should be created.
-	TrackChain(chainName string, genesisBlock *common.Block, createChain CreateChainCallback)
+	TrackChain(chainName string, genesisBlock *common.Block, createChain func())
 }
 
 //go:generate mockery -dir . -name ChainGetter -case underscore -output mocks
@@ -59,7 +59,7 @@ type Config struct {
 	EvictionSuspicion string // Duration threshold that the node samples in order to suspect its eviction from the channel.
 }
 
-// Consenter implements etddraft consenter
+// Consenter implements etcdraft consenter
 type Consenter struct {
 	CreateChain           func(chainName string)
 	InactiveChainRegistry InactiveChainRegistry
@@ -72,6 +72,7 @@ type Consenter struct {
 	OrdererConfig  localconfig.TopLevel
 	Cert           []byte
 	Metrics        *Metrics
+	BCCSP          bccsp.BCCSP
 }
 
 // TargetChannel extracts the channel from the given proto.Message.
@@ -105,10 +106,21 @@ func (c *Consenter) ReceiverByChain(channelID string) MessageReceiver {
 }
 
 func (c *Consenter) detectSelfID(consenters map[uint64]*etcdraft.Consenter) (uint64, error) {
+	thisNodeCertAsDER, err := pemToDER(c.Cert, 0, "server", c.Logger)
+	if err != nil {
+		return 0, err
+	}
+
 	var serverCertificates []string
 	for nodeID, cst := range consenters {
 		serverCertificates = append(serverCertificates, string(cst.ServerTlsCert))
-		if bytes.Equal(c.Cert, cst.ServerTlsCert) {
+
+		certAsDER, err := pemToDER(cst.ServerTlsCert, nodeID, "server", c.Logger)
+		if err != nil {
+			return 0, err
+		}
+
+		if bytes.Equal(thisNodeCertAsDER, certAsDER) {
 			return nodeID, nil
 		}
 	}
@@ -148,10 +160,15 @@ func (c *Consenter) HandleChain(support consensus.ConsenterSupport, metadata *co
 
 	id, err := c.detectSelfID(consenters)
 	if err != nil {
-		c.InactiveChainRegistry.TrackChain(support.ChainID(), support.Block(0), func() {
-			c.CreateChain(support.ChainID())
-		})
-		return &inactive.Chain{Err: errors.Errorf("channel %s is not serviced by me", support.ChainID())}, nil
+		if c.InactiveChainRegistry != nil {
+			// There is a system channel, use the InactiveChainRegistry to track the future config updates of application channel.
+			c.InactiveChainRegistry.TrackChain(support.ChannelID(), support.Block(0), func() {
+				c.CreateChain(support.ChannelID())
+			})
+			return &inactive.Chain{Err: errors.Errorf("channel %s is not serviced by me", support.ChannelID())}, nil
+		}
+
+		return nil, errors.Wrap(err, "without a system channel, a follower should have been created")
 	}
 
 	var evictionSuspicion time.Duration
@@ -188,8 +205,8 @@ func (c *Consenter) HandleChain(support consensus.ConsenterSupport, metadata *co
 
 		MigrationInit: isMigration,
 
-		WALDir:            path.Join(c.EtcdRaftConfig.WALDir, support.ChainID()),
-		SnapDir:           path.Join(c.EtcdRaftConfig.SnapDir, support.ChainID()),
+		WALDir:            path.Join(c.EtcdRaftConfig.WALDir, support.ChannelID()),
+		SnapDir:           path.Join(c.EtcdRaftConfig.SnapDir, support.ChannelID()),
 		EvictionSuspicion: evictionSuspicion,
 		Cert:              c.Cert,
 		Metrics:           c.Metrics,
@@ -198,64 +215,80 @@ func (c *Consenter) HandleChain(support consensus.ConsenterSupport, metadata *co
 	rpc := &cluster.RPC{
 		Timeout:       c.OrdererConfig.General.Cluster.RPCTimeout,
 		Logger:        c.Logger,
-		Channel:       support.ChainID(),
+		Channel:       support.ChannelID(),
 		Comm:          c.Communication,
 		StreamsByType: cluster.NewStreamsByType(),
 	}
+
+	// when we have a system channel
+	if c.InactiveChainRegistry != nil {
+		return NewChain(
+			support,
+			opts,
+			c.Communication,
+			rpc,
+			c.BCCSP,
+			func() (BlockPuller, error) {
+				return NewBlockPuller(support, c.Dialer, c.OrdererConfig.General.Cluster, c.BCCSP)
+			},
+			func() {
+				c.InactiveChainRegistry.TrackChain(support.ChannelID(), nil, func() { c.CreateChain(support.ChannelID()) })
+			},
+			nil,
+		)
+	}
+
+	// when we do NOT have a system channel
 	return NewChain(
 		support,
 		opts,
 		c.Communication,
 		rpc,
-		func() (BlockPuller, error) { return newBlockPuller(support, c.Dialer, c.OrdererConfig.General.Cluster) },
+		c.BCCSP,
+		func() (BlockPuller, error) {
+			return NewBlockPuller(support, c.Dialer, c.OrdererConfig.General.Cluster, c.BCCSP)
+		},
+		func() {
+			c.Logger.Warning("Start a follower.Chain: not yet implemented")
+			//TODO plug a function pointer to start follower.Chain
+		},
 		nil,
 	)
 }
 
-// ValidateConsensusMetadata determines the validity of a
-// ConsensusMetadata update during config updates on the channel.
-// Since the ConsensusMetadata is specific to the consensus implementation (independent of the particular
-// chain) this validation also needs to be implemented by the specific consensus implementation.
-func (c *Consenter) ValidateConsensusMetadata(oldMetadataBytes, newMetadataBytes []byte, newChannel bool) error {
-	// metadata was not updated
-	if newMetadataBytes == nil {
-		return nil
+func (c *Consenter) IsChannelMember(joinBlock *common.Block) (bool, error) {
+	if joinBlock == nil {
+		return false, errors.New("nil block")
 	}
-	if oldMetadataBytes == nil {
-		c.Logger.Panic("Programming Error: ValidateConsensusMetadata called with nil old metadata")
-	}
-
-	oldMetadata := &etcdraft.ConfigMetadata{}
-	if err := proto.Unmarshal(oldMetadataBytes, oldMetadata); err != nil {
-		c.Logger.Panicf("Programming Error: Failed to unmarshal old etcdraft consensus metadata: %v", err)
-	}
-	newMetadata := &etcdraft.ConfigMetadata{}
-	if err := proto.Unmarshal(newMetadataBytes, newMetadata); err != nil {
-		return errors.Wrap(err, "failed to unmarshal new etcdraft metadata configuration")
-	}
-
-	err := CheckConfigMetadata(newMetadata)
+	envelopeConfig, err := protoutil.ExtractEnvelope(joinBlock, 0)
 	if err != nil {
-		return errors.Wrap(err, "invalid new config metdadata")
+		return false, err
+	}
+	bundle, err := channelconfig.NewBundleFromEnvelope(envelopeConfig, c.BCCSP)
+	if err != nil {
+		return false, err
+	}
+	oc, exists := bundle.OrdererConfig()
+	if !exists {
+		return false, errors.New("no orderer config in bundle")
+	}
+	configMetadata := &etcdraft.ConfigMetadata{}
+	if err := proto.Unmarshal(oc.ConsensusMetadata(), configMetadata); err != nil {
+		return false, err
+	}
+	if err := CheckConfigMetadata(configMetadata); err != nil {
+		return false, err
 	}
 
-	if newChannel {
-		// check if the consenters are a subset of the existing consenters (system channel consenters)
-		set := ConsentersToMap(oldMetadata.Consenters)
-		for _, c := range newMetadata.Consenters {
-			if _, exits := set[string(c.ClientTlsCert)]; !exits {
-				return errors.New("new channel has consenter that is not part of system consenter set")
-			}
+	member := false
+	for _, consenter := range configMetadata.Consenters {
+		if bytes.Equal(c.Cert, consenter.ServerTlsCert) || bytes.Equal(c.Cert, consenter.ClientTlsCert) {
+			member = true
+			break
 		}
-		return nil
 	}
 
-	// create the dummy parameters for ComputeMembershipChanges
-	dummyOldBlockMetadata, _ := ReadBlockMetadata(nil, oldMetadata)
-	dummyOldConsentersMap := CreateConsentersMap(dummyOldBlockMetadata, oldMetadata)
-	_, err = ComputeMembershipChanges(dummyOldBlockMetadata, dummyOldConsentersMap, newMetadata.Consenters)
-
-	return err
+	return member, nil
 }
 
 // ReadBlockMetadata attempts to read raft metadata from block metadata, if available.
@@ -291,6 +324,7 @@ func New(
 	r *multichannel.Registrar,
 	icr InactiveChainRegistry,
 	metricsProvider metrics.Provider,
+	bccsp bccsp.BCCSP,
 ) *Consenter {
 	logger := flogging.MustGetLogger("orderer.consensus.etcdraft")
 
@@ -310,6 +344,7 @@ func New(
 		Dialer:                clusterDialer,
 		Metrics:               NewMetrics(metricsProvider),
 		InactiveChainRegistry: icr,
+		BCCSP:                 bccsp,
 	}
 	consenter.Dispatcher = &Dispatcher{
 		Logger:        logger,
@@ -329,6 +364,11 @@ func New(
 		Dispatcher: comm,
 	}
 	orderer.RegisterClusterServer(srv.Server(), svc)
+
+	if icr == nil {
+		logger.Debug("Created an etcdraft consenter without a system channel, InactiveChainRegistry is nil")
+	}
+
 	return consenter
 }
 

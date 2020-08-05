@@ -13,11 +13,12 @@ import (
 	"encoding/pem"
 	"time"
 
+	"github.com/hyperledger/fabric-protos-go/common"
+	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/common/flogging"
-	"github.com/hyperledger/fabric/core/comm"
+	"github.com/hyperledger/fabric/internal/pkg/comm"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/hyperledger/fabric/orderer/common/localconfig"
-	"github.com/hyperledger/fabric/protos/common"
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
 )
@@ -138,12 +139,16 @@ func (r *Replicator) ReplicateChains() []string {
 			if err != nil {
 				r.Logger.Panicf("Failed to create a ledger for channel %s: %v", channel.ChannelName, err)
 			}
-			gb, err := ChannelCreationBlockToGenesisBlock(channel.GenesisBlock)
-			if err != nil {
-				r.Logger.Panicf("Failed converting channel creation block for channel %s to genesis block: %v",
-					channel.ChannelName, err)
+
+			if channel.GenesisBlock == nil {
+				if ledger.Height() == 0 {
+					r.Logger.Panicf("Expecting channel %s to at least contain genesis block, but it doesn't", channel.ChannelName)
+				}
+
+				continue
 			}
-			r.appendBlock(gb, ledger, channel.ChannelName)
+
+			r.appendBlock(channel.GenesisBlock, ledger, channel.ChannelName)
 		}
 	}
 
@@ -189,7 +194,7 @@ func (r *Replicator) PullChannel(channel string) error {
 		r.Logger.Panicf("Failed to create a ledger for channel %s: %v", channel, err)
 	}
 
-	endpoint, latestHeight, _ := latestHeightAndEndpoint(puller)
+	endpoint, latestHeight, _ := LatestHeightAndEndpoint(puller)
 	if endpoint == "" {
 		return errors.Errorf("failed obtaining the latest block for channel %s", channel)
 	}
@@ -349,19 +354,19 @@ type VerifierRetriever interface {
 }
 
 // BlockPullerFromConfigBlock returns a BlockPuller that doesn't verify signatures on blocks.
-func BlockPullerFromConfigBlock(conf PullerConfig, block *common.Block, verifierRetriever VerifierRetriever) (*BlockPuller, error) {
+func BlockPullerFromConfigBlock(conf PullerConfig, block *common.Block, verifierRetriever VerifierRetriever, bccsp bccsp.BCCSP) (*BlockPuller, error) {
 	if block == nil {
 		return nil, errors.New("nil block")
 	}
 
-	endpoints, err := EndpointconfigFromConfigBlock(block)
+	endpoints, err := EndpointconfigFromConfigBlock(block, bccsp)
 	if err != nil {
 		return nil, err
 	}
 
 	clientConf := comm.ClientConfig{
 		Timeout: conf.Timeout,
-		SecOpts: &comm.SecureOptions{
+		SecOpts: comm.SecureOptions{
 			Certificate:       conf.TLSCert,
 			Key:               conf.TLSKey,
 			RequireClientCert: true,
@@ -379,7 +384,7 @@ func BlockPullerFromConfigBlock(conf PullerConfig, block *common.Block, verifier
 	}
 
 	return &BlockPuller{
-		Logger:  flogging.MustGetLogger("orderer.common.cluster.replication"),
+		Logger:  flogging.MustGetLogger("orderer.common.cluster.replication").With("channel", conf.Channel),
 		Dialer:  dialer,
 		TLSCert: tlsCertAsDER.Bytes,
 		VerifyBlockSequence: func(blocks []*common.Block, channel string) error {
@@ -463,7 +468,7 @@ func Participant(puller ChainPuller, analyzeLastConfBlock SelfMembershipPredicat
 
 // PullLastConfigBlock pulls the last configuration block, or returns an error on failure.
 func PullLastConfigBlock(puller ChainPuller) (*common.Block, error) {
-	endpoint, latestHeight, err := latestHeightAndEndpoint(puller)
+	endpoint, latestHeight, err := LatestHeightAndEndpoint(puller)
 	if err != nil {
 		return nil, err
 	}
@@ -474,7 +479,7 @@ func PullLastConfigBlock(puller ChainPuller) (*common.Block, error) {
 	if lastBlock == nil {
 		return nil, ErrRetryCountExhausted
 	}
-	lastConfNumber, err := lastConfigFromBlock(lastBlock)
+	lastConfNumber, err := protoutil.GetLastConfigIndexFromBlock(lastBlock)
 	if err != nil {
 		return nil, err
 	}
@@ -489,7 +494,7 @@ func PullLastConfigBlock(puller ChainPuller) (*common.Block, error) {
 	return lastConfigBlock, nil
 }
 
-func latestHeightAndEndpoint(puller ChainPuller) (string, uint64, error) {
+func LatestHeightAndEndpoint(puller ChainPuller) (string, uint64, error) {
 	var maxHeight uint64
 	var mostUpToDateEndpoint string
 	heightsByEndpoints, err := puller.HeightsByEndpoints()
@@ -503,13 +508,6 @@ func latestHeightAndEndpoint(puller ChainPuller) (string, uint64, error) {
 		}
 	}
 	return mostUpToDateEndpoint, maxHeight, nil
-}
-
-func lastConfigFromBlock(block *common.Block) (uint64, error) {
-	if block.Metadata == nil || len(block.Metadata.Metadata) <= int(common.BlockMetadataIndex_LAST_CONFIG) {
-		return 0, errors.New("no metadata in block")
-	}
-	return protoutil.GetLastConfigIndexFromBlock(block)
 }
 
 // Close closes the ChainInspector
@@ -549,23 +547,25 @@ func (ci *ChainInspector) Channels() []ChannelGenesisBlock {
 			ci.Logger.Panicf("Failed pulling block [%d] from the system channel", seq)
 		}
 		ci.validateHashPointer(block, prevHash)
-		channel, err := IsNewChannelBlock(block)
-		if err != nil {
-			// If we failed to classify a block, something is wrong in the system chain
-			// we're trying to pull, so abort.
-			ci.Logger.Panicf("Failed classifying block [%d]: %s", seq, err)
-			continue
-		}
 		// Set the previous hash for the next iteration
 		prevHash = protoutil.BlockHeaderHash(block.Header)
+
+		channel, gb, err := ExtractGenesisBlock(ci.Logger, block)
+		if err != nil {
+			// If we failed to inspect a block, something is wrong in the system chain
+			// we're trying to pull, so abort.
+			ci.Logger.Panicf("Failed extracting channel genesis block from config block: %v", err)
+		}
+
 		if channel == "" {
 			ci.Logger.Info("Block", seq, "doesn't contain a new channel")
 			continue
 		}
+
 		ci.Logger.Info("Block", seq, "contains channel", channel)
 		channels[channel] = ChannelGenesisBlock{
 			ChannelName:  channel,
-			GenesisBlock: block,
+			GenesisBlock: gb,
 		}
 	}
 	// At this point, block holds reference to the last block pulled.
@@ -600,83 +600,78 @@ func flattenChannelMap(m map[string]ChannelGenesisBlock) []ChannelGenesisBlock {
 	return res
 }
 
-// ChannelCreationBlockToGenesisBlock converts a channel creation block to a genesis block
-func ChannelCreationBlockToGenesisBlock(block *common.Block) (*common.Block, error) {
+// ExtractGenesisBlock determines if a config block creates new channel, in which
+// case it returns channel name, genesis block and nil error.
+func ExtractGenesisBlock(logger *flogging.FabricLogger, block *common.Block) (string, *common.Block, error) {
 	if block == nil {
-		return nil, errors.New("nil block")
+		return "", nil, errors.New("nil block")
 	}
 	env, err := protoutil.ExtractEnvelope(block, 0)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	payload, err := protoutil.ExtractPayload(env)
+	payload, err := protoutil.UnmarshalPayload(env.Payload)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
-	block.Data.Data = [][]byte{payload.Data}
-	block.Header.DataHash = protoutil.BlockDataHash(block.Data)
-	block.Header.Number = 0
-	block.Header.PreviousHash = nil
+	if payload.Header == nil {
+		return "", nil, errors.New("nil header in payload")
+	}
+	chdr, err := protoutil.UnmarshalChannelHeader(payload.Header.ChannelHeader)
+	if err != nil {
+		return "", nil, err
+	}
+	// The transaction is not orderer transaction
+	if common.HeaderType(chdr.Type) != common.HeaderType_ORDERER_TRANSACTION {
+		return "", nil, nil
+	}
+	systemChannelName := chdr.ChannelId
+	innerEnvelope, err := protoutil.UnmarshalEnvelope(payload.Data)
+	if err != nil {
+		return "", nil, err
+	}
+	innerPayload, err := protoutil.UnmarshalPayload(innerEnvelope.Payload)
+	if err != nil {
+		return "", nil, err
+	}
+	if innerPayload.Header == nil {
+		return "", nil, errors.New("inner payload's header is nil")
+	}
+	chdr, err = protoutil.UnmarshalChannelHeader(innerPayload.Header.ChannelHeader)
+	if err != nil {
+		return "", nil, err
+	}
+	// The inner payload's header should be a config transaction
+	if common.HeaderType(chdr.Type) != common.HeaderType_CONFIG {
+		logger.Warnf("Expecting %s envelope in block, got %s", common.HeaderType_CONFIG, common.HeaderType(chdr.Type))
+		return "", nil, nil
+	}
+	// In any case, exclude all system channel transactions
+	if chdr.ChannelId == systemChannelName {
+		logger.Warnf("Expecting config envelope in %s block to target a different "+
+			"channel other than system channel '%s'", common.HeaderType_ORDERER_TRANSACTION, systemChannelName)
+		return "", nil, nil
+	}
+
 	metadata := &common.BlockMetadata{
 		Metadata: make([][]byte, 4),
 	}
-	block.Metadata = metadata
+	metadata.Metadata[common.BlockMetadataIndex_SIGNATURES] = protoutil.MarshalOrPanic(&common.OrdererBlockMetadata{
+		LastConfig: &common.LastConfig{Index: 0},
+		// This is a genesis block, peer never verify this signature because we can't bootstrap
+		// trust from an earlier block, hence there are no signatures here.
+	})
 	metadata.Metadata[common.BlockMetadataIndex_LAST_CONFIG] = protoutil.MarshalOrPanic(&common.Metadata{
 		Value: protoutil.MarshalOrPanic(&common.LastConfig{Index: 0}),
 		// This is a genesis block, peer never verify this signature because we can't bootstrap
 		// trust from an earlier block, hence there are no signatures here.
 	})
-	return block, nil
-}
 
-// IsNewChannelBlock returns a name of the channel in case
-// it holds a channel create transaction, or empty string otherwise.
-func IsNewChannelBlock(block *common.Block) (string, error) {
-	if block == nil {
-		return "", errors.New("nil block")
+	blockdata := &common.BlockData{Data: [][]byte{payload.Data}}
+	b := &common.Block{
+		Header:   &common.BlockHeader{DataHash: protoutil.BlockDataHash(blockdata)},
+		Data:     blockdata,
+		Metadata: metadata,
 	}
-	env, err := protoutil.ExtractEnvelope(block, 0)
-	if err != nil {
-		return "", err
-	}
-	payload, err := protoutil.ExtractPayload(env)
-	if err != nil {
-		return "", err
-	}
-	if payload.Header == nil {
-		return "", errors.New("nil header in payload")
-	}
-	chdr, err := protoutil.UnmarshalChannelHeader(payload.Header.ChannelHeader)
-	if err != nil {
-		return "", err
-	}
-	// The transaction is an orderer transaction
-	if common.HeaderType(chdr.Type) != common.HeaderType_ORDERER_TRANSACTION {
-		return "", nil
-	}
-	systemChannelName := chdr.ChannelId
-	innerEnvelope, err := protoutil.UnmarshalEnvelope(payload.Data)
-	if err != nil {
-		return "", err
-	}
-	innerPayload, err := protoutil.UnmarshalPayload(innerEnvelope.Payload)
-	if err != nil {
-		return "", err
-	}
-	if innerPayload.Header == nil {
-		return "", errors.New("inner payload's header is nil")
-	}
-	chdr, err = protoutil.UnmarshalChannelHeader(innerPayload.Header.ChannelHeader)
-	if err != nil {
-		return "", err
-	}
-	// The inner payload's header is a config transaction
-	if common.HeaderType(chdr.Type) != common.HeaderType_CONFIG {
-		return "", nil
-	}
-	// In any case, exclude all system channel transactions
-	if chdr.ChannelId == systemChannelName {
-		return "", nil
-	}
-	return chdr.ChannelId, nil
+	return chdr.ChannelId, b, nil
 }

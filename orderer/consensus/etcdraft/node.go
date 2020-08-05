@@ -14,10 +14,10 @@ import (
 	"time"
 
 	"code.cloudfoundry.org/clock"
-	"github.com/gogo/protobuf/proto"
+	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric-protos-go/orderer"
+	"github.com/hyperledger/fabric-protos-go/orderer/etcdraft"
 	"github.com/hyperledger/fabric/common/flogging"
-	"github.com/hyperledger/fabric/protos/orderer"
-	"github.com/hyperledger/fabric/protos/orderer/etcdraft"
 	"github.com/hyperledger/fabric/protoutil"
 	"go.etcd.io/etcd/raft"
 	"go.etcd.io/etcd/raft/raftpb"
@@ -30,6 +30,8 @@ type node struct {
 
 	unreachableLock sync.RWMutex
 	unreachable     map[uint64]struct{}
+
+	tracker *Tracker
 
 	storage *RaftStorage
 	config  *raft.Config
@@ -80,6 +82,9 @@ func (n *node) start(fresh, join bool) {
 }
 
 func (n *node) run(campaign bool) {
+	electionTimeout := n.tickInterval.Seconds() * float64(n.config.ElectionTick)
+	halfElectionTimeout := electionTimeout / 2
+
 	raftTicker := n.clock.NewTicker(n.tickInterval)
 
 	if s := n.storage.Snapshot(); !raft.IsEmptySnap(s) {
@@ -119,7 +124,12 @@ func (n *node) run(campaign bool) {
 	for {
 		select {
 		case <-raftTicker.C():
+			// grab raft Status before ticking it, so `RecentActive` attributes
+			// are not reset yet.
+			status := n.Status()
+
 			n.Tick()
+			n.tracker.Check(&status)
 
 		case rd := <-n.Ready():
 			startStoring := n.clock.Now()
@@ -128,6 +138,9 @@ func (n *node) run(campaign bool) {
 			}
 			duration := n.clock.Since(startStoring).Seconds()
 			n.metrics.DataPersistDuration.Observe(float64(duration))
+			if duration > halfElectionTimeout {
+				n.logger.Warningf("WAL sync took %v seconds and the network is configured to start elections after %v seconds. Your disk is too slow and may cause loss of quorum and trigger leadership election.", duration, electionTimeout)
+			}
 
 			if !raft.IsEmptySnap(rd.Snapshot) {
 				n.chain.snapC <- &rd.Snapshot
@@ -251,8 +264,11 @@ func (n *node) abdicateLeader(currentLead uint64) {
 		n.TransferLeadership(context.TODO(), status.ID, transferee)
 	}
 
+	timer := n.clock.NewTimer(time.Duration(n.config.ElectionTick) * n.tickInterval)
+	defer timer.Stop() // prevent timer leak
+
 	select {
-	case <-n.clock.After(time.Duration(n.config.ElectionTick) * n.tickInterval):
+	case <-timer.C():
 		n.logger.Warn("Leader transfer timeout")
 	case l := <-notifyc:
 		n.logger.Infof("Leader has been transferred from %d to %d", currentLead, l)

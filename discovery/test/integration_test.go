@@ -24,15 +24,21 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric-protos-go/common"
+	. "github.com/hyperledger/fabric-protos-go/discovery"
+	"github.com/hyperledger/fabric-protos-go/gossip"
+	msprotos "github.com/hyperledger/fabric-protos-go/msp"
+	"github.com/hyperledger/fabric-protos-go/peer"
+	"github.com/hyperledger/fabric/bccsp/sw"
 	bccsp "github.com/hyperledger/fabric/bccsp/utils"
 	"github.com/hyperledger/fabric/common/cauthdsl"
 	"github.com/hyperledger/fabric/common/configtx"
 	"github.com/hyperledger/fabric/common/crypto/tlsgen"
 	"github.com/hyperledger/fabric/common/policies"
+	"github.com/hyperledger/fabric/common/policydsl"
 	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/core/cclifecycle"
 	lifecyclemocks "github.com/hyperledger/fabric/core/cclifecycle/mocks"
-	"github.com/hyperledger/fabric/core/comm"
 	"github.com/hyperledger/fabric/core/common/ccprovider"
 	"github.com/hyperledger/fabric/discovery"
 	disc "github.com/hyperledger/fabric/discovery/client"
@@ -47,16 +53,13 @@ import (
 	gdisc "github.com/hyperledger/fabric/gossip/discovery"
 	"github.com/hyperledger/fabric/gossip/protoext"
 	"github.com/hyperledger/fabric/internal/configtxgen/encoder"
-	genesisconfig "github.com/hyperledger/fabric/internal/configtxgen/localconfig"
+	"github.com/hyperledger/fabric/internal/configtxgen/genesisconfig"
+	"github.com/hyperledger/fabric/internal/pkg/comm"
 	"github.com/hyperledger/fabric/msp"
-	"github.com/hyperledger/fabric/protos/common"
-	. "github.com/hyperledger/fabric/protos/discovery"
-	"github.com/hyperledger/fabric/protos/gossip"
-	msprotos "github.com/hyperledger/fabric/protos/msp"
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/onsi/gomega/gexec"
 	"github.com/pkg/errors"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 )
 
@@ -117,7 +120,7 @@ func TestMain(m *testing.M) {
 
 func TestGreenPath(t *testing.T) {
 	t.Parallel()
-	client, service := createClientAndService(t, testdir)
+	client, admin, service := createClientAndService(t, testdir)
 	defer service.Stop()
 	defer client.conn.Close()
 
@@ -142,81 +145,93 @@ func TestGreenPath(t *testing.T) {
 	nonExistentCollection := &ChaincodeCall{Name: "cc2", CollectionNames: []string{"col3"}}
 	_ = nonExistentCollection
 	req, err := req.AddPeersQuery().AddPeersQuery(col1).AddPeersQuery(nonExistentCollection).AddConfigQuery().AddEndorsersQuery(cc2cc, ccWithCollection)
-	assert.NoError(t, err)
-	res, err := client.Send(context.Background(), req, client.AuthInfo)
-	assert.NoError(t, err)
 
 	t.Run("Local peer query", func(t *testing.T) {
+		require.NoError(t, err)
+		res, err := admin.Send(context.Background(), req, admin.AuthInfo)
+		require.NoError(t, err)
 		returnedPeers, err := res.ForLocal().Peers()
-		assert.NoError(t, err)
-		assert.True(t, peersToTestPeers(returnedPeers).Equal(testPeers.withoutStateInfo()))
+		require.NoError(t, err)
+		require.True(t, peersToTestPeers(returnedPeers).Equal(testPeers.withoutStateInfo()))
 	})
 
 	t.Run("Channel peer queries", func(t *testing.T) {
+		require.NoError(t, err)
+		res, err := client.Send(context.Background(), req, client.AuthInfo)
+		require.NoError(t, err)
 		returnedPeers, err := res.ForChannel("mychannel").Peers()
-		assert.NoError(t, err)
-		assert.True(t, peersToTestPeers(returnedPeers).Equal(testPeers))
+		require.NoError(t, err)
+		require.True(t, peersToTestPeers(returnedPeers).Equal(testPeers))
 
 		returnedPeers, err = res.ForChannel("mychannel").Peers(col1)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		// Ensure only peers from Org1 are returned
 		for _, p := range returnedPeers {
-			assert.Equal(t, "Org1MSP", p.MSPID)
+			require.Equal(t, "Org1MSP", p.MSPID)
 		}
 
 		// Ensure that the client handles correctly errors returned from the server
 		// in case of a bad request
-		returnedPeers, err = res.ForChannel("mychannel").Peers(nonExistentCollection)
-		assert.Equal(t, "collection col3 doesn't exist in collection config for chaincode cc2", err.Error())
+		_, err = res.ForChannel("mychannel").Peers(nonExistentCollection)
+		require.EqualError(t, err, "collection col3 doesn't exist in collection config for chaincode cc2")
 	})
 
 	t.Run("Endorser chaincode to chaincode", func(t *testing.T) {
+		require.NoError(t, err)
+		res, err := client.Send(context.Background(), req, client.AuthInfo)
+		require.NoError(t, err)
 		endorsers, err := res.ForChannel("mychannel").Endorsers(cc2cc.Chaincodes, disc.NoFilter)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		endorsersByMSP := map[string][]string{}
 
 		for _, endorser := range endorsers {
 			endorsersByMSP[endorser.MSPID] = append(endorsersByMSP[endorser.MSPID], string(endorser.Identity))
 		}
 		// For cc2cc we expect 2 peers from Org1MSP and 1 from Org2MSP
-		assert.Equal(t, 2, len(endorsersByMSP["Org1MSP"]))
-		assert.Equal(t, 1, len(endorsersByMSP["Org2MSP"]))
+		require.Equal(t, 2, len(endorsersByMSP["Org1MSP"]))
+		require.Equal(t, 1, len(endorsersByMSP["Org2MSP"]))
 	})
 
 	t.Run("Endorser chaincode with collection", func(t *testing.T) {
+		require.NoError(t, err)
+		res, err := client.Send(context.Background(), req, client.AuthInfo)
+		require.NoError(t, err)
 		endorsers, err := res.ForChannel("mychannel").Endorsers(ccWithCollection.Chaincodes, disc.NoFilter)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 
 		endorsersByMSP := map[string][]string{}
 		for _, endorser := range endorsers {
 			endorsersByMSP[endorser.MSPID] = append(endorsersByMSP[endorser.MSPID], string(endorser.Identity))
 		}
-		assert.Equal(t, 1, len(endorsersByMSP["Org1MSP"]))
-		assert.Equal(t, 1, len(endorsersByMSP["Org2MSP"]))
+		require.Equal(t, 1, len(endorsersByMSP["Org1MSP"]))
+		require.Equal(t, 1, len(endorsersByMSP["Org2MSP"]))
 	})
 
 	t.Run("Config query", func(t *testing.T) {
+		require.NoError(t, err)
+		res, err := client.Send(context.Background(), req, client.AuthInfo)
+		require.NoError(t, err)
 		conf, err := res.ForChannel("mychannel").Config()
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		// Ensure MSP Configs are exactly as they appear in the config block
 		for mspID, mspConfig := range conf.Msps {
 			expectedConfig := service.sup.mspConfigs[mspID]
-			assert.Equal(t, expectedConfig, mspConfig)
+			require.Equal(t, expectedConfig, mspConfig)
 		}
 		// Ensure orderer endpoints are as they appear in the config block
 		for mspID, endpoints := range conf.Orderers {
-			assert.Equal(t, "OrdererMSP", mspID)
+			require.Equal(t, "OrdererMSP", mspID)
 			endpoints := endpoints.Endpoint
-			assert.Len(t, endpoints, 1)
-			assert.Equal(t, "orderer.example.com", endpoints[0].Host)
-			assert.Equal(t, uint32(7050), endpoints[0].Port)
+			require.Len(t, endpoints, 1)
+			require.Equal(t, "orderer.example.com", endpoints[0].Host)
+			require.Equal(t, uint32(7050), endpoints[0].Port)
 		}
 	})
 }
 
 func TestEndorsementComputationFailure(t *testing.T) {
 	t.Parallel()
-	client, service := createClientAndService(t, testdir)
+	client, _, service := createClientAndService(t, testdir)
 	defer service.Stop()
 	defer client.conn.Close()
 
@@ -232,18 +247,18 @@ func TestEndorsementComputationFailure(t *testing.T) {
 		},
 	}
 	req, err := disc.NewRequest().OfChannel("mychannel").AddEndorsersQuery(ccWithCollection)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	res, err := client.Send(context.Background(), req, client.AuthInfo)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	endorsers, err := res.ForChannel("mychannel").Endorsers(ccWithCollection.Chaincodes, disc.NoFilter)
-	assert.Empty(t, endorsers)
-	assert.Contains(t, err.Error(), "failed constructing descriptor")
+	require.Empty(t, endorsers)
+	require.Contains(t, err.Error(), "failed constructing descriptor")
 }
 
 func TestLedgerFailure(t *testing.T) {
 	t.Parallel()
-	client, service := createClientAndService(t, testdir)
+	client, _, service := createClientAndService(t, testdir)
 	defer service.Stop()
 	defer client.conn.Close()
 
@@ -258,38 +273,38 @@ func TestLedgerFailure(t *testing.T) {
 		},
 	}
 	req, err := disc.NewRequest().OfChannel("mychannel").AddEndorsersQuery(ccWithCollection)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	res, err := client.Send(context.Background(), req, client.AuthInfo)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	endorsers, err := res.ForChannel("mychannel").Endorsers(ccWithCollection.Chaincodes, disc.NoFilter)
-	assert.Empty(t, endorsers)
-	assert.Contains(t, err.Error(), "failed constructing descriptor")
+	require.Empty(t, endorsers)
+	require.Contains(t, err.Error(), "failed constructing descriptor")
 }
 
 func TestRevocation(t *testing.T) {
 	t.Parallel()
-	client, service := createClientAndService(t, testdir)
+	client, _, service := createClientAndService(t, testdir)
 	defer service.Stop()
 	defer client.conn.Close()
 
 	req := disc.NewRequest().OfChannel("mychannel").AddPeersQuery()
 	res, err := client.Send(context.Background(), req, client.AuthInfo)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	// Record number of times we deserialized the identity
 	firstCount := atomic.LoadUint32(&service.sup.deserializeIdentityCount)
 
 	// Do the same query again
 	peers, err := res.ForChannel("mychannel").Peers()
-	assert.NotEmpty(t, peers)
-	assert.NoError(t, err)
+	require.NotEmpty(t, peers)
+	require.NoError(t, err)
 
-	res, err = client.Send(context.Background(), req, client.AuthInfo)
-	assert.NoError(t, err)
+	_, err = client.Send(context.Background(), req, client.AuthInfo)
+	require.NoError(t, err)
 	// The amount of times deserializeIdentity was called should not have changed
 	// because requests should have hit the cache
 	secondCount := atomic.LoadUint32(&service.sup.deserializeIdentityCount)
-	assert.Equal(t, firstCount, secondCount)
+	require.Equal(t, firstCount, secondCount)
 
 	// Now, increment the config sequence
 	oldSeq := service.sup.sequenceWrapper.Sequence()
@@ -302,16 +317,16 @@ func TestRevocation(t *testing.T) {
 
 	// Send the query for the third time
 	res, err = client.Send(context.Background(), req, client.AuthInfo)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	// The cache should have been purged, thus deserializeIdentity should have been
 	// called an additional time
 	thirdCount := atomic.LoadUint32(&service.sup.deserializeIdentityCount)
-	assert.NotEqual(t, thirdCount, secondCount)
+	require.NotEqual(t, thirdCount, secondCount)
 
 	// We should be denied access
 	peers, err = res.ForChannel("mychannel").Peers()
-	assert.Empty(t, peers)
-	assert.Contains(t, err.Error(), "access denied")
+	require.Empty(t, peers)
+	require.Contains(t, err.Error(), "access denied")
 }
 
 type client struct {
@@ -410,10 +425,10 @@ func createSupport(t *testing.T, dir string, lsccMetadataManager *lsccMetadataMa
 
 	channelVerifier := discacl.NewChannelVerifier(policies.ChannelApplicationWriters, polMgr)
 
-	org1Admin, err := cauthdsl.FromString("OR('Org1MSP.admin')")
-	assert.NoError(t, err)
+	org1Admin, err := policydsl.FromString("OR('Org1MSP.admin')")
+	require.NoError(t, err)
 	org1AdminPolicy, _, err := cauthdsl.NewPolicyProvider(org1MSP).NewPolicy(protoutil.MarshalOrPanic(org1Admin))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	acl := discacl.NewDiscoverySupport(channelVerifier, org1AdminPolicy, chConfig)
 
 	gSup := &mocks.GossipSupport{}
@@ -442,16 +457,16 @@ func createSupport(t *testing.T, dir string, lsccMetadataManager *lsccMetadataMa
 	}
 }
 
-func createClientAndService(t *testing.T, testdir string) (*client, *service) {
+func createClientAndService(t *testing.T, testdir string) (*client, *client, *service) {
 	ca, err := tlsgen.NewCA()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	serverKeyPair, err := ca.NewServerCertKeyPair("127.0.0.1")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Create a server on an ephemeral port
 	gRPCServer, err := comm.NewGRPCServer("127.0.0.1:", comm.ServerConfig{
-		SecOpts: &comm.SecureOptions{
+		SecOpts: comm.SecureOptions{
 			Key:         serverKeyPair.Key,
 			Certificate: serverKeyPair.Cert,
 			UseTLS:      true,
@@ -469,62 +484,82 @@ func createClientAndService(t *testing.T, testdir string) (*client, *service) {
 
 	RegisterDiscoveryServer(gRPCServer.Server(), svc)
 
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	go gRPCServer.Start()
 
 	clientKeyPair, err := ca.NewClientCertKeyPair()
-	assert.NoError(t, err)
-
-	signer := createSigner(t)
-
-	authInfo := &AuthInfo{
-		ClientIdentity:    signer.Creator,
-		ClientTlsCertHash: util.ComputeSHA256(clientKeyPair.TLSCert.Raw),
-	}
+	require.NoError(t, err)
 
 	dialer, err := comm.NewGRPCClient(comm.ClientConfig{
 		Timeout: time.Second * 3,
-		SecOpts: &comm.SecureOptions{
+		SecOpts: comm.SecureOptions{
 			UseTLS:        true,
 			Certificate:   clientKeyPair.Cert,
 			Key:           clientKeyPair.Key,
 			ServerRootCAs: [][]byte{ca.CertBytes()},
 		},
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
-	conn, err := dialer.NewConnection(gRPCServer.Address(), "")
-	assert.NoError(t, err)
+	conn, err := dialer.NewConnection(gRPCServer.Address())
+	require.NoError(t, err)
 
-	wrapperClient := &client{AuthInfo: authInfo, conn: conn}
+	userSigner := createUserSigner(t)
+	wrapperUserClient := &client{AuthInfo: &AuthInfo{
+		ClientIdentity:    userSigner.Creator,
+		ClientTlsCertHash: util.ComputeSHA256(clientKeyPair.TLSCert.Raw),
+	}, conn: conn}
 	var signerCacheSize uint = 10
-	c := disc.NewClient(wrapperClient.newConnection, signer.Sign, signerCacheSize)
-	wrapperClient.Client = c
+	wrapperUserClient.Client = disc.NewClient(wrapperUserClient.newConnection, userSigner.Sign, signerCacheSize)
+
+	adminSigner := createAdminSigner(t)
+	wrapperAdminClient := &client{AuthInfo: &AuthInfo{
+		ClientIdentity:    adminSigner.Creator,
+		ClientTlsCertHash: util.ComputeSHA256(clientKeyPair.TLSCert.Raw),
+	}, conn: conn}
+	wrapperAdminClient.Client = disc.NewClient(wrapperAdminClient.newConnection, adminSigner.Sign, signerCacheSize)
+
 	service := &service{Server: gRPCServer.Server(), lsccMetadataManager: l, sup: sup}
-	return wrapperClient, service
+	return wrapperUserClient, wrapperAdminClient, service
 }
 
-func createSigner(t *testing.T) *signer {
+func createUserSigner(t *testing.T) *signer {
+	identityDir := filepath.Join(testdir, "crypto-config", "peerOrganizations", "org1.example.com", "users", "User1@org1.example.com", "msp")
+	certPath := filepath.Join(identityDir, "signcerts", "User1@org1.example.com-cert.pem")
+	keyPath := filepath.Join(identityDir, "keystore")
+	keys, err := ioutil.ReadDir(keyPath)
+	require.NoError(t, err)
+	require.Len(t, keys, 1)
+	keyPath = filepath.Join(keyPath, keys[0].Name())
+	signer, err := newSigner("Org1MSP", certPath, keyPath)
+	require.NoError(t, err)
+	return signer
+}
+
+func createAdminSigner(t *testing.T) *signer {
 	identityDir := filepath.Join(testdir, "crypto-config", "peerOrganizations", "org1.example.com", "users", "Admin@org1.example.com", "msp")
 	certPath := filepath.Join(identityDir, "signcerts", "Admin@org1.example.com-cert.pem")
 	keyPath := filepath.Join(identityDir, "keystore")
 	keys, err := ioutil.ReadDir(keyPath)
-	assert.NoError(t, err)
-	assert.Len(t, keys, 1)
+	require.NoError(t, err)
+	require.Len(t, keys, 1)
 	keyPath = filepath.Join(keyPath, keys[0].Name())
 	signer, err := newSigner("Org1MSP", certPath, keyPath)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	return signer
 }
 
 func createMSP(t *testing.T, dir, mspID string) (msp.MSP, *msprotos.FabricMSPConfig) {
-	channelMSP, err := msp.New(&msp.BCCSPNewOpts{
-		NewBaseOpts: msp.NewBaseOpts{Version: msp.MSPv1_1},
-	})
-	assert.NoError(t, err)
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+	channelMSP, err := msp.New(
+		&msp.BCCSPNewOpts{NewBaseOpts: msp.NewBaseOpts{Version: msp.MSPv1_4_3}},
+		cryptoProvider,
+	)
+	require.NoError(t, err)
 
 	mspConf, err := msp.GetVerifyingMspConfig(dir, mspID, "bccsp")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	fabConf := &msprotos.FabricMSPConfig{}
 	proto.Unmarshal(mspConf.Config, fabConf)
@@ -566,16 +601,16 @@ func createChannelConfigGetter(s *sequenceWrapper, mspMgr msp.MSPManager) discac
 	resources := &mocks.Resources{}
 	resources.ConfigtxValidatorReturns(s)
 	resources.MSPManagerReturns(mspMgr)
-	chConfig := &mocks.ChanConfig{}
+	chConfig := &mocks.ChannelConfigGetter{}
 	chConfig.GetChannelConfigReturns(resources)
 	return chConfig
 }
 
 func createPolicyManagerGetter(t *testing.T, mspMgr msp.MSPManager) *mocks.ChannelPolicyManagerGetter {
-	org1Org2Members, err := cauthdsl.FromString("OR('Org1MSP.client', 'Org2MSP.client')")
-	assert.NoError(t, err)
+	org1Org2Members, err := policydsl.FromString("OR('Org1MSP.client', 'Org2MSP.client')")
+	require.NoError(t, err)
 	org1Org2MembersPolicy, _, err := cauthdsl.NewPolicyProvider(mspMgr).NewPolicy(protoutil.MarshalOrPanic(org1Org2Members))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	polMgr := &mocks.ChannelPolicyManagerGetter{}
 	policyMgr := &mocks.PolicyManager{}
@@ -591,7 +626,7 @@ func buildBinaries() error {
 		return errors.WithStack(err)
 	}
 
-	idemixgen, err = gexec.Build("github.com/hyperledger/fabric/common/tools/idemixgen")
+	idemixgen, err = gexec.Build("github.com/hyperledger/fabric/cmd/idemixgen")
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -845,14 +880,14 @@ func aliveMsg(pkiID gcommon.PKIidType) gdisc.NetworkMember {
 }
 
 func buildCollectionConfig(col2principals map[string][]*msprotos.MSPPrincipal) []byte {
-	collections := &common.CollectionConfigPackage{}
+	collections := &peer.CollectionConfigPackage{}
 	for col, principals := range col2principals {
-		collections.Config = append(collections.Config, &common.CollectionConfig{
-			Payload: &common.CollectionConfig_StaticCollectionConfig{
-				StaticCollectionConfig: &common.StaticCollectionConfig{
+		collections.Config = append(collections.Config, &peer.CollectionConfig{
+			Payload: &peer.CollectionConfig_StaticCollectionConfig{
+				StaticCollectionConfig: &peer.StaticCollectionConfig{
 					Name: col,
-					MemberOrgsPolicy: &common.CollectionPolicyConfig{
-						Payload: &common.CollectionPolicyConfig_SignaturePolicy{
+					MemberOrgsPolicy: &peer.CollectionPolicyConfig{
+						Payload: &peer.CollectionPolicyConfig_SignaturePolicy{
 							SignaturePolicy: &common.SignaturePolicyEnvelope{
 								Identities: principals,
 							},
@@ -876,7 +911,7 @@ func orgPrincipal(mspID string) *msprotos.MSPPrincipal {
 }
 
 func policyFromString(s string) *common.SignaturePolicyEnvelope {
-	p, err := cauthdsl.FromString(s)
+	p, err := policydsl.FromString(s)
 	if err != nil {
 		panic(err)
 	}
@@ -939,7 +974,7 @@ func signECDSA(k *ecdsa.PrivateKey, digest []byte) (signature []byte, err error)
 		return nil, err
 	}
 
-	s, _, err = bccsp.ToLowS(&k.PublicKey, s)
+	s, err = bccsp.ToLowS(&k.PublicKey, s)
 	if err != nil {
 		return nil, err
 	}

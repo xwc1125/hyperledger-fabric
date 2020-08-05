@@ -14,14 +14,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/hyperledger/fabric/common/cauthdsl"
+	"github.com/hyperledger/fabric-protos-go/common"
+	"github.com/hyperledger/fabric-protos-go/ledger/rwset"
+	"github.com/hyperledger/fabric-protos-go/ledger/rwset/kvrwset"
+	protosmsp "github.com/hyperledger/fabric-protos-go/msp"
+	"github.com/hyperledger/fabric-protos-go/peer"
+	protospeer "github.com/hyperledger/fabric-protos-go/peer"
+	"github.com/hyperledger/fabric/bccsp/sw"
 	commonerrors "github.com/hyperledger/fabric/common/errors"
-	"github.com/hyperledger/fabric/common/ledger/testutil"
-	mockconfig "github.com/hyperledger/fabric/common/mocks/config"
+	"github.com/hyperledger/fabric/common/policydsl"
 	"github.com/hyperledger/fabric/common/semaphore"
-	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/core/committer/txvalidator"
+	tmocks "github.com/hyperledger/fabric/core/committer/txvalidator/mocks"
 	txvalidatorplugin "github.com/hyperledger/fabric/core/committer/txvalidator/plugin"
 	txvalidatorv20 "github.com/hyperledger/fabric/core/committer/txvalidator/v20"
 	txvalidatormocks "github.com/hyperledger/fabric/core/committer/txvalidator/v20/mocks"
@@ -31,47 +35,31 @@ import (
 	"github.com/hyperledger/fabric/core/handlers/validation/builtin"
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/rwsetutil"
-	ledgerutils "github.com/hyperledger/fabric/core/ledger/util"
 	mocktxvalidator "github.com/hyperledger/fabric/core/mocks/txvalidator"
 	"github.com/hyperledger/fabric/core/scc/lscc"
 	supportmocks "github.com/hyperledger/fabric/discovery/support/mocks"
+	"github.com/hyperledger/fabric/internal/pkg/txflags"
 	"github.com/hyperledger/fabric/msp"
 	"github.com/hyperledger/fabric/msp/mgmt"
 	msptesttools "github.com/hyperledger/fabric/msp/mgmt/testtools"
-	"github.com/hyperledger/fabric/protos/common"
-	protosmsp "github.com/hyperledger/fabric/protos/msp"
-	"github.com/hyperledger/fabric/protos/peer"
-	protospeer "github.com/hyperledger/fabric/protos/peer"
-	"github.com/hyperledger/fabric/protos/token"
 	"github.com/hyperledger/fabric/protoutil"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 func signedByAnyMember(ids []string) []byte {
-	p := cauthdsl.SignedByAnyMember(ids)
+	p := policydsl.SignedByAnyMember(ids)
 	return protoutil.MarshalOrPanic(&protospeer.ApplicationPolicy{Type: &protospeer.ApplicationPolicy_SignaturePolicy{SignaturePolicy: p}})
 }
 
-func v20Capabilities() *mockconfig.MockApplicationCapabilities {
-	return &mockconfig.MockApplicationCapabilities{
-		V1_2ValidationRv:      true,
-		V1_3ValidationRv:      true,
-		PrivateChannelDataRv:  true,
-		KeyLevelEndorsementRv: true,
-		V2_0ValidationRv:      true,
-	}
-}
-
-func fabTokenCapabilities() *mockconfig.MockApplicationCapabilities {
-	return &mockconfig.MockApplicationCapabilities{
-		V1_2ValidationRv:      true,
-		V1_3ValidationRv:      true,
-		PrivateChannelDataRv:  true,
-		KeyLevelEndorsementRv: true,
-		V2_0ValidationRv:      true,
-		FabTokenRv:            true,
-	}
+func v20Capabilities() *tmocks.ApplicationCapabilities {
+	ac := &tmocks.ApplicationCapabilities{}
+	ac.On("V1_2Validation").Return(true)
+	ac.On("V1_3Validation").Return(true)
+	ac.On("V2_0Validation").Return(true)
+	ac.On("PrivateChannelData").Return(true)
+	ac.On("KeyLevelEndorsement").Return(true)
+	return ac
 }
 
 func createRWset(t *testing.T, ccnames ...string) []byte {
@@ -80,8 +68,9 @@ func createRWset(t *testing.T, ccnames ...string) []byte {
 		rwsetBuilder.AddToWriteSet(ccname, "key", []byte("value"))
 	}
 	rwset, err := rwsetBuilder.GetTxSimulationResults()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	rwsetBytes, err := rwset.GetPubSimulationBytes()
+	require.NoError(t, err)
 	return rwsetBytes
 }
 
@@ -92,7 +81,7 @@ func getProposalWithType(ccID string, pType common.HeaderType) (*peer.Proposal, 
 			Input:       &peer.ChaincodeInput{Args: [][]byte{[]byte("func")}},
 			Type:        peer.ChaincodeSpec_GOLANG}}
 
-	proposal, _, err := protoutil.CreateProposalFromCIS(pType, util.GetTestChainID(), cis, signerSerialized)
+	proposal, _, err := protoutil.CreateProposalFromCIS(pType, "testchannelid", cis, signerSerialized)
 	return proposal, err
 }
 
@@ -101,17 +90,17 @@ const ccVersion = "1.0"
 func getEnvWithType(ccID string, event []byte, res []byte, pType common.HeaderType, t *testing.T) *common.Envelope {
 	// get a toy proposal
 	prop, err := getProposalWithType(ccID, pType)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	response := &peer.Response{Status: 200}
 
 	// endorse it to get a proposal response
-	presp, err := protoutil.CreateProposalResponse(prop.Header, prop.Payload, response, res, event, &peer.ChaincodeID{Name: ccID, Version: ccVersion}, nil, signer)
-	assert.NoError(t, err)
+	presp, err := protoutil.CreateProposalResponse(prop.Header, prop.Payload, response, res, event, &peer.ChaincodeID{Name: ccID, Version: ccVersion}, signer)
+	require.NoError(t, err)
 
 	// assemble a transaction from that proposal and endorsement
 	tx, err := protoutil.CreateSignedTx(prop, signer, presp)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	return tx
 }
@@ -132,84 +121,32 @@ func getEnvWithSigner(ccID string, event []byte, res []byte, sig msp.SigningIden
 	}
 
 	sID, err := sig.Serialize()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	prop, _, err := protoutil.CreateProposalFromCIS(pType, "foochain", cis, sID)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	response := &peer.Response{Status: 200}
 
 	// endorse it to get a proposal response
-	presp, err := protoutil.CreateProposalResponse(prop.Header, prop.Payload, response, res, event, &peer.ChaincodeID{Name: ccID, Version: ccVersion}, nil, sig)
-	assert.NoError(t, err)
+	presp, err := protoutil.CreateProposalResponse(prop.Header, prop.Payload, response, res, event, &peer.ChaincodeID{Name: ccID, Version: ccVersion}, sig)
+	require.NoError(t, err)
 
 	// assemble a transaction from that proposal and endorsement
 	tx, err := protoutil.CreateSignedTx(prop, sig, presp)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	return tx
 }
 
-func getTokenTx(t *testing.T) *common.Envelope {
-	transactionData := &token.TokenTransaction{
-		Action: &token.TokenTransaction_TokenAction{
-			TokenAction: &token.TokenAction{
-				Data: &token.TokenAction_Issue{
-					Issue: &token.Issue{
-						Outputs: []*token.Token{
-							{Owner: &token.TokenOwner{Raw: []byte("owner-1")}, Type: "TOK1", Quantity: ToHex(111)},
-							{Owner: &token.TokenOwner{Raw: []byte("owner-2")}, Type: "TOK2", Quantity: ToHex(222)},
-						},
-					},
-				},
-			},
-		},
-	}
-	tdBytes, err := proto.Marshal(transactionData)
-	assert.NoError(t, err)
-
-	signerBytes, err := signer.Serialize()
-	assert.NoError(t, err)
-	nonce := []byte{0, 1, 2, 3, 4}
-	txID, err := protoutil.ComputeTxID(nonce, signerBytes)
-	assert.NoError(t, err)
-
-	hdr := &common.Header{
-		SignatureHeader: protoutil.MarshalOrPanic(
-			&common.SignatureHeader{
-				Creator: signerBytes,
-				Nonce:   nonce,
-			},
-		),
-		ChannelHeader: protoutil.MarshalOrPanic(
-			&common.ChannelHeader{
-				Type: int32(common.HeaderType_TOKEN_TRANSACTION),
-				TxId: txID,
-			},
-		),
-	}
-
-	// create the payload
-	payl := &common.Payload{Header: hdr, Data: tdBytes}
-	paylBytes, err := protoutil.GetBytesPayload(payl)
-	assert.NoError(t, err)
-
-	// sign the payload
-	sig, err := signer.Sign(paylBytes)
-	assert.NoError(t, err)
-
-	// here's the envelope
-	return &common.Envelope{Payload: paylBytes, Signature: sig}
-}
-
 func assertInvalid(block *common.Block, t *testing.T, code peer.TxValidationCode) {
-	txsFilter := ledgerutils.TxValidationFlags(block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
-	assert.True(t, txsFilter.IsInvalid(0))
-	assert.True(t, txsFilter.IsSetTo(0, code))
+	txsFilter := txflags.ValidationFlags(block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
+	require.True(t, txsFilter.IsInvalid(0))
+	require.True(t, txsFilter.IsSetTo(0, code))
 }
 
 func assertValid(block *common.Block, t *testing.T) {
-	txsFilter := ledgerutils.TxValidationFlags(block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
-	assert.False(t, txsFilter.IsInvalid(0))
+	txsFilter := txflags.ValidationFlags(block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
+	require.False(t, txsFilter.IsInvalid(0))
 }
 
 func setupValidator() (*txvalidatorv20.TxValidator, *txvalidatormocks.QueryExecutor, *supportmocks.Identity, *txvalidatormocks.CollectionResources) {
@@ -242,15 +179,17 @@ func setupValidatorWithMspMgr(mspmgr msp.MSPManager, mockID *supportmocks.Identi
 
 	mockCR := &txvalidatormocks.CollectionResources{}
 
+	cryptoProvider, _ := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
 	v := txvalidatorv20.NewTxValidator(
 		"",
 		semaphore.New(10),
 		&mocktxvalidator.Support{ACVal: v20Capabilities(), MSPManagerVal: mspmgr},
 		mockLedger,
-		&lscc.LifeCycleSysCC{},
+		&lscc.SCC{BCCSP: cryptoProvider},
 		mockCR,
 		pm,
 		mockCpmg,
+		cryptoProvider,
 	)
 
 	return v, mockQE, mockID, mockCR
@@ -265,7 +204,7 @@ func TestInvokeBadRWSet(t *testing.T) {
 	b := &common.Block{Data: &common.BlockData{Data: [][]byte{protoutil.MarshalOrPanic(tx)}}, Header: &common.BlockHeader{Number: 1}}
 
 	err := v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertInvalid(b, t, peer.TxValidationCode_BAD_RWSET)
 }
 
@@ -285,7 +224,7 @@ func TestInvokeNoPolicy(t *testing.T) {
 	b := &common.Block{Data: &common.BlockData{Data: [][]byte{protoutil.MarshalOrPanic(tx)}}, Header: &common.BlockHeader{Number: 2}}
 
 	err := v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertInvalid(b, t, peer.TxValidationCode_INVALID_CHAINCODE)
 }
 
@@ -306,8 +245,58 @@ func TestInvokeOK(t *testing.T) {
 	b := &common.Block{Data: &common.BlockData{Data: [][]byte{protoutil.MarshalOrPanic(tx)}}, Header: &common.BlockHeader{Number: 2}}
 
 	err := v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertValid(b, t)
+}
+
+func TestInvokeNOKDuplicateNs(t *testing.T) {
+	ccID := "mycc"
+
+	v, mockQE, _, _ := setupValidator()
+
+	mockQE.On("GetState", "lscc", ccID).Return(protoutil.MarshalOrPanic(&ccp.ChaincodeData{
+		Name:    ccID,
+		Version: ccVersion,
+		Vscc:    "vscc",
+		Policy:  signedByAnyMember([]string{"SampleOrg"}),
+	}), nil)
+	mockQE.On("GetStateMetadata", ccID, "key").Return(nil, nil)
+
+	// note that this read-write set has two read-write sets for the same namespace and key
+	txrws := &rwset.TxReadWriteSet{
+		DataModel: rwset.TxReadWriteSet_KV,
+		NsRwset: []*rwset.NsReadWriteSet{
+			{
+				Namespace: "mycc",
+				Rwset: protoutil.MarshalOrPanic(&kvrwset.KVRWSet{
+					Writes: []*kvrwset.KVWrite{
+						{
+							Key:   "foo",
+							Value: []byte("bar1"),
+						},
+					},
+				}),
+			},
+			{
+				Namespace: "mycc",
+				Rwset: protoutil.MarshalOrPanic(&kvrwset.KVRWSet{
+					Writes: []*kvrwset.KVWrite{
+						{
+							Key:   "foo",
+							Value: []byte("bar2"),
+						},
+					},
+				}),
+			},
+		},
+	}
+
+	tx := getEnv(ccID, nil, protoutil.MarshalOrPanic(txrws), t)
+	b := &common.Block{Data: &common.BlockData{Data: [][]byte{protoutil.MarshalOrPanic(tx)}}, Header: &common.BlockHeader{Number: 2}}
+
+	err := v.Validate(b)
+	require.NoError(t, err)
+	assertInvalid(b, t, peer.TxValidationCode_ILLEGAL_WRITESET)
 }
 
 func TestInvokeNoRWSet(t *testing.T) {
@@ -328,7 +317,7 @@ func TestInvokeNoRWSet(t *testing.T) {
 	b := &common.Block{Data: &common.BlockData{Data: [][]byte{protoutil.MarshalOrPanic(tx)}}, Header: &common.BlockHeader{Number: 2}}
 
 	err := v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertInvalid(b, t, peer.TxValidationCode_ENDORSEMENT_POLICY_FAILURE)
 }
 
@@ -480,7 +469,7 @@ func TestParallelValidation(t *testing.T) {
 
 	mockCR.On("CollectionValidationInfo", ccID, "col1", mock.Anything).Return(nil, nil, nil)
 
-	policy := cauthdsl.SignedByMspPeer("Org1")
+	policy := policydsl.SignedByMspPeer("Org1")
 	polBytes := protoutil.MarshalOrPanic(&protospeer.ApplicationPolicy{Type: &protospeer.ApplicationPolicy_SignaturePolicy{SignaturePolicy: policy}})
 	mockQE.On("GetState", "lscc", ccID).Return(protoutil.MarshalOrPanic(&ccp.ChaincodeData{
 		Name:    ccID,
@@ -563,8 +552,9 @@ func TestParallelValidation(t *testing.T) {
 			sig = sigID0
 		}
 		rwset, err := rwsetBuilder.GetTxSimulationResults()
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		rwsetBytes, err := rwset.GetPubSimulationBytes()
+		require.NoError(t, err)
 		tx := getEnvWithSigner(ccID, nil, rwsetBytes, sig, t)
 		blockData = append(blockData, protoutil.MarshalOrPanic(tx))
 	}
@@ -574,10 +564,10 @@ func TestParallelValidation(t *testing.T) {
 
 	// validate the block
 	err := v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Block metadata array position to store serialized bit array filter of invalid transactions
-	txsFilter := ledgerutils.TxValidationFlags(b.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
+	txsFilter := txflags.ValidationFlags(b.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
 	// tx validity
 	for txNum := 0; txNum < txCnt; txNum += 1 {
 		switch uint(txNum / 10) {
@@ -588,9 +578,9 @@ func TestParallelValidation(t *testing.T) {
 		case 6:
 			fallthrough
 		case 9:
-			assert.True(t, txsFilter.IsInvalid(txNum))
+			require.True(t, txsFilter.IsInvalid(txNum))
 		default:
-			assert.False(t, txsFilter.IsInvalid(txNum))
+			require.False(t, txsFilter.IsInvalid(txNum))
 		}
 	}
 }
@@ -646,7 +636,7 @@ func testCCEventMismatchedName(t *testing.T, v txvalidator.Validator, ccID strin
 	b := &common.Block{Data: &common.BlockData{Data: [][]byte{protoutil.MarshalOrPanic(tx)}}, Header: &common.BlockHeader{Number: 2}}
 
 	err := v.Validate(b)
-	assert.NoError(t, err) // TODO, convert test so it can check the error text for INVALID_OTHER_REASON
+	require.NoError(t, err) // TODO, convert test so it can check the error text for INVALID_OTHER_REASON
 	assertInvalid(b, t, peer.TxValidationCode_INVALID_OTHER_REASON)
 }
 
@@ -655,7 +645,7 @@ func testCCEventBadBytes(t *testing.T, v txvalidator.Validator, ccID string) {
 	b := &common.Block{Data: &common.BlockData{Data: [][]byte{protoutil.MarshalOrPanic(tx)}}, Header: &common.BlockHeader{Number: 2}}
 
 	err := v.Validate(b)
-	assert.NoError(t, err) // TODO, convert test so it can check the error text for INVALID_OTHER_REASON
+	require.NoError(t, err) // TODO, convert test so it can check the error text for INVALID_OTHER_REASON
 	assertInvalid(b, t, peer.TxValidationCode_INVALID_OTHER_REASON)
 }
 
@@ -664,7 +654,7 @@ func testCCEventGoodPath(t *testing.T, v txvalidator.Validator, ccID string) {
 	b := &common.Block{Data: &common.BlockData{Data: [][]byte{protoutil.MarshalOrPanic(tx)}}, Header: &common.BlockHeader{Number: 2}}
 
 	err := v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertValid(b, t)
 }
 
@@ -687,15 +677,15 @@ func TestInvokeOKPvtDataOnly(t *testing.T) {
 	rwsetBuilder := rwsetutil.NewRWSetBuilder()
 	rwsetBuilder.AddToPvtAndHashedWriteSet(ccID, "mycollection", "somekey", nil)
 	rwset, err := rwsetBuilder.GetTxSimulationResults()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	rwsetBytes, err := rwset.GetPubSimulationBytes()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	tx := getEnv(ccID, nil, rwsetBytes, t)
 	b := &common.Block{Data: &common.BlockData{Data: [][]byte{protoutil.MarshalOrPanic(tx)}}, Header: &common.BlockHeader{Number: 2}}
 
 	err = v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertInvalid(b, t, peer.TxValidationCode_ENDORSEMENT_POLICY_FAILURE)
 }
 
@@ -716,15 +706,15 @@ func TestInvokeOKMetaUpdateOnly(t *testing.T) {
 	rwsetBuilder := rwsetutil.NewRWSetBuilder()
 	rwsetBuilder.AddToMetadataWriteSet(ccID, "somekey", map[string][]byte{})
 	rwset, err := rwsetBuilder.GetTxSimulationResults()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	rwsetBytes, err := rwset.GetPubSimulationBytes()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	tx := getEnv(ccID, nil, rwsetBytes, t)
 	b := &common.Block{Data: &common.BlockData{Data: [][]byte{protoutil.MarshalOrPanic(tx)}}, Header: &common.BlockHeader{Number: 2}}
 
 	err = v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertInvalid(b, t, peer.TxValidationCode_ENDORSEMENT_POLICY_FAILURE)
 }
 
@@ -747,15 +737,15 @@ func TestInvokeOKPvtMetaUpdateOnly(t *testing.T) {
 	rwsetBuilder := rwsetutil.NewRWSetBuilder()
 	rwsetBuilder.AddToHashedMetadataWriteSet(ccID, "mycollection", "somekey", map[string][]byte{})
 	rwset, err := rwsetBuilder.GetTxSimulationResults()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	rwsetBytes, err := rwset.GetPubSimulationBytes()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	tx := getEnv(ccID, nil, rwsetBytes, t)
 	b := &common.Block{Data: &common.BlockData{Data: [][]byte{protoutil.MarshalOrPanic(tx)}}, Header: &common.BlockHeader{Number: 2}}
 
 	err = v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertInvalid(b, t, peer.TxValidationCode_ENDORSEMENT_POLICY_FAILURE)
 }
 
@@ -776,7 +766,7 @@ func TestInvokeNOKWritesToLSCC(t *testing.T) {
 	b := &common.Block{Data: &common.BlockData{Data: [][]byte{protoutil.MarshalOrPanic(tx)}}, Header: &common.BlockHeader{Number: 2}}
 
 	err := v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertInvalid(b, t, peer.TxValidationCode_INVALID_CHAINCODE)
 }
 
@@ -800,7 +790,7 @@ func TestInvokeNOKWritesToESCC(t *testing.T) {
 	}
 
 	err := v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertInvalid(b, t, peer.TxValidationCode_INVALID_CHAINCODE)
 }
 
@@ -825,7 +815,7 @@ func TestInvokeNOKWritesToNotExt(t *testing.T) {
 	}
 
 	err := v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertInvalid(b, t, peer.TxValidationCode_INVALID_CHAINCODE)
 }
 
@@ -843,7 +833,7 @@ func TestInvokeNOKInvokesNotExt(t *testing.T) {
 	}
 
 	err := v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertInvalid(b, t, peer.TxValidationCode_INVALID_CHAINCODE)
 }
 
@@ -859,7 +849,7 @@ func TestInvokeNOKInvokesEmptyCCName(t *testing.T) {
 	}
 
 	err := v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertInvalid(b, t, peer.TxValidationCode_INVALID_CHAINCODE)
 }
 
@@ -875,7 +865,7 @@ func TestInvokeNOKBogusActions(t *testing.T) {
 	}
 
 	err := v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertInvalid(b, t, peer.TxValidationCode_BAD_RWSET)
 }
 
@@ -892,7 +882,7 @@ func TestInvokeNOKCCDoesntExist(t *testing.T) {
 	}
 
 	err := v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertInvalid(b, t, peer.TxValidationCode_INVALID_CHAINCODE)
 }
 
@@ -915,7 +905,7 @@ func TestInvokeNOKVSCCUnspecified(t *testing.T) {
 	}
 
 	err := v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertInvalid(b, t, peer.TxValidationCode_INVALID_CHAINCODE)
 }
 
@@ -925,7 +915,7 @@ func TestInvokeNoBlock(t *testing.T) {
 		Data:   &common.BlockData{Data: [][]byte{}},
 		Header: &common.BlockHeader{},
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }
 
 func TestValidateTxWithStateBasedEndorsement(t *testing.T) {
@@ -939,68 +929,14 @@ func TestValidateTxWithStateBasedEndorsement(t *testing.T) {
 		Vscc:    "vscc",
 		Policy:  signedByAnyMember([]string{"SampleOrg"}),
 	}), nil)
-	mockQE.On("GetStateMetadata", ccID, "key").Return(map[string][]byte{peer.MetaDataKeys_VALIDATION_PARAMETER.String(): protoutil.MarshalOrPanic(&protospeer.ApplicationPolicy{Type: &protospeer.ApplicationPolicy_SignaturePolicy{SignaturePolicy: cauthdsl.RejectAllPolicy}})}, nil)
+	mockQE.On("GetStateMetadata", ccID, "key").Return(map[string][]byte{peer.MetaDataKeys_VALIDATION_PARAMETER.String(): protoutil.MarshalOrPanic(&protospeer.ApplicationPolicy{Type: &protospeer.ApplicationPolicy_SignaturePolicy{SignaturePolicy: policydsl.RejectAllPolicy}})}, nil)
 
 	tx := getEnv(ccID, nil, createRWset(t, ccID), t)
 	b := &common.Block{Data: &common.BlockData{Data: [][]byte{protoutil.MarshalOrPanic(tx)}}, Header: &common.BlockHeader{Number: 3}}
 
 	err := v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertInvalid(b, t, peer.TxValidationCode_ENDORSEMENT_POLICY_FAILURE)
-}
-
-func TestTokenValidTransaction(t *testing.T) {
-	v, _, _, _ := setupValidator()
-	v.ChannelResources.(*mocktxvalidator.Support).ACVal = fabTokenCapabilities()
-
-	tx := getTokenTx(t)
-	b := &common.Block{Data: &common.BlockData{Data: [][]byte{protoutil.MarshalOrPanic(tx)}}, Header: &common.BlockHeader{Number: 1}}
-
-	err := v.Validate(b)
-	assert.NoError(t, err)
-	assertValid(b, t)
-}
-
-func TestTokenCapabilityNotEnabled(t *testing.T) {
-	v, _, _, _ := setupValidator()
-
-	tx := getTokenTx(t)
-	b := &common.Block{Data: &common.BlockData{Data: [][]byte{protoutil.MarshalOrPanic(tx)}}, Header: &common.BlockHeader{Number: 1}}
-
-	err := v.Validate(b)
-
-	assertion := assert.New(t)
-	// We expect no validation error because we simply mark the tx as invalid
-	assertion.NoError(err)
-
-	// We expect the tx to be invalid because of a duplicate txid
-	txsfltr := ledgerutils.TxValidationFlags(b.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
-	assertion.True(txsfltr.IsInvalid(0))
-	assertion.True(txsfltr.Flag(0) == peer.TxValidationCode_UNKNOWN_TX_TYPE)
-}
-
-func TestTokenDuplicateTxId(t *testing.T) {
-	v, _, _, _ := setupValidator()
-	v.ChannelResources.(*mocktxvalidator.Support).ACVal = fabTokenCapabilities()
-
-	mockLedger := &txvalidatormocks.LedgerResources{}
-	v.LedgerResources = mockLedger
-	mockLedger.On("GetTransactionByID", mock.Anything).Return(&peer.ProcessedTransaction{}, nil)
-
-	tx := getTokenTx(t)
-
-	b := testutil.NewBlock([]*common.Envelope{tx}, 0, nil)
-
-	err := v.Validate(b)
-
-	assertion := assert.New(t)
-	// We expect no validation error because we simply mark the tx as invalid
-	assertion.NoError(err)
-
-	// We expect the tx to be invalid because of a duplicate txid
-	txsfltr := ledgerutils.TxValidationFlags(b.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
-	assertion.True(txsfltr.IsInvalid(0))
-	assertion.True(txsfltr.Flag(0) == peer.TxValidationCode_DUPLICATE_TXID)
 }
 
 func TestDynamicCapabilitiesAndMSP(t *testing.T) {
@@ -1024,7 +960,7 @@ func TestDynamicCapabilitiesAndMSP(t *testing.T) {
 
 	// Perform a validation of a block
 	err := v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertValid(b, t)
 	// Record the number of times the capabilities and the MSP Manager were invoked
 	capabilityInvokeCount := v.ChannelResources.(*mocktxvalidator.Support).CapabilitiesInvokeCount()
@@ -1032,15 +968,15 @@ func TestDynamicCapabilitiesAndMSP(t *testing.T) {
 
 	// Perform another validation pass, and ensure it is valid
 	err = v.Validate(b)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertValid(b, t)
 
 	// Ensure that the capabilities were retrieved from the support twice,
 	// which proves that the capabilities are dynamically retrieved from the support each time
-	assert.Equal(t, 2*capabilityInvokeCount, v.ChannelResources.(*mocktxvalidator.Support).CapabilitiesInvokeCount())
+	require.Equal(t, 2*capabilityInvokeCount, v.ChannelResources.(*mocktxvalidator.Support).CapabilitiesInvokeCount())
 	// Ensure that the MSP Manager was retrieved from the support twice,
 	// which proves that the MSP Manager is dynamically retrieved from the support each time
-	assert.Equal(t, 2*mspManagerInvokeCount, v.ChannelResources.(*mocktxvalidator.Support).MSPManagerInvokeCount())
+	require.Equal(t, 2*mspManagerInvokeCount, v.ChannelResources.(*mocktxvalidator.Support).MSPManagerInvokeCount())
 }
 
 // TestLedgerIsNoAvailable simulates and provides a test for following scenario,
@@ -1065,7 +1001,7 @@ func TestLedgerIsNotAvailable(t *testing.T) {
 
 	err := v.Validate(b)
 
-	assertion := assert.New(t)
+	assertion := require.New(t)
 	// We suppose to get the error which indicates we cannot commit the block
 	assertion.Error(err)
 	// The error exptected to be of type VSCCInfoLookupFailureError
@@ -1090,7 +1026,7 @@ func TestLedgerIsNotAvailableForCheckingTxidDuplicate(t *testing.T) {
 
 	err := v.Validate(b)
 
-	assertion := assert.New(t)
+	assertion := require.New(t)
 	// We expect a validation error because the ledger wasn't ready to tell us whether there was a tx with that ID or not
 	assertion.Error(err)
 }
@@ -1113,12 +1049,12 @@ func TestDuplicateTxId(t *testing.T) {
 
 	err := v.Validate(b)
 
-	assertion := assert.New(t)
+	assertion := require.New(t)
 	// We expect no validation error because we simply mark the tx as invalid
 	assertion.NoError(err)
 
 	// We expect the tx to be invalid because of a duplicate txid
-	txsfltr := ledgerutils.TxValidationFlags(b.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
+	txsfltr := txflags.ValidationFlags(b.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
 	assertion.True(txsfltr.IsInvalid(0))
 	assertion.True(txsfltr.Flag(0) == peer.TxValidationCode_DUPLICATE_TXID)
 }
@@ -1150,15 +1086,19 @@ func TestValidationInvalidEndorsing(t *testing.T) {
 	mockCpmg := &plugindispatchermocks.ChannelPolicyManagerGetter{}
 	mockCpmg.On("Manager", mock.Anything).Return(&txvalidatormocks.PolicyManager{})
 
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+
 	v := txvalidatorv20.NewTxValidator(
 		"",
 		semaphore.New(10),
 		&mocktxvalidator.Support{ACVal: v20Capabilities(), MSPManagerVal: mspmgr},
 		mockLedger,
-		&lscc.LifeCycleSysCC{},
+		&lscc.SCC{BCCSP: cryptoProvider},
 		&txvalidatormocks.CollectionResources{},
 		pm,
 		mockCpmg,
+		cryptoProvider,
 	)
 
 	tx := getEnv(ccID, nil, createRWset(t, ccID), t)
@@ -1180,9 +1120,9 @@ func TestValidationInvalidEndorsing(t *testing.T) {
 	}
 
 	// Keep default callback
-	err := v.Validate(b)
+	err = v.Validate(b)
 	// Restore default callback
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assertInvalid(b, t, peer.TxValidationCode_ENDORSEMENT_POLICY_FAILURE)
 }
 
@@ -1221,15 +1161,18 @@ func TestValidationPluginExecutionError(t *testing.T) {
 	mockCpmg := &plugindispatchermocks.ChannelPolicyManagerGetter{}
 	mockCpmg.On("Manager", mock.Anything).Return(&txvalidatormocks.PolicyManager{})
 
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
 	v := txvalidatorv20.NewTxValidator(
 		"",
 		semaphore.New(10),
 		&mocktxvalidator.Support{ACVal: v20Capabilities(), MSPManagerVal: mspmgr},
 		mockLedger,
-		&lscc.LifeCycleSysCC{},
+		&lscc.SCC{BCCSP: cryptoProvider},
 		&txvalidatormocks.CollectionResources{},
 		pm,
 		mockCpmg,
+		cryptoProvider,
 	)
 
 	tx := getEnv(ccID, nil, createRWset(t, ccID), t)
@@ -1238,9 +1181,9 @@ func TestValidationPluginExecutionError(t *testing.T) {
 		Header: &common.BlockHeader{},
 	}
 
-	err := v.Validate(b)
+	err = v.Validate(b)
 	executionErr := err.(*commonerrors.VSCCExecutionFailureError)
-	assert.Contains(t, executionErr.Error(), "I/O error")
+	require.Contains(t, executionErr.Error(), "I/O error")
 }
 
 func TestValidationPluginNotFound(t *testing.T) {
@@ -1271,15 +1214,18 @@ func TestValidationPluginNotFound(t *testing.T) {
 	mockCpmg := &plugindispatchermocks.ChannelPolicyManagerGetter{}
 	mockCpmg.On("Manager", mock.Anything).Return(&txvalidatormocks.PolicyManager{})
 
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
 	v := txvalidatorv20.NewTxValidator(
 		"",
 		semaphore.New(10),
 		&mocktxvalidator.Support{ACVal: v20Capabilities(), MSPManagerVal: mspmgr},
 		mockLedger,
-		&lscc.LifeCycleSysCC{},
+		&lscc.SCC{BCCSP: cryptoProvider},
 		&txvalidatormocks.CollectionResources{},
 		pm,
 		mockCpmg,
+		cryptoProvider,
 	)
 
 	tx := getEnv(ccID, nil, createRWset(t, ccID), t)
@@ -1288,9 +1234,9 @@ func TestValidationPluginNotFound(t *testing.T) {
 		Header: &common.BlockHeader{},
 	}
 
-	err := v.Validate(b)
+	err = v.Validate(b)
 	executionErr := err.(*commonerrors.VSCCExecutionFailureError)
-	assert.Contains(t, executionErr.Error(), "plugin with name vscc wasn't found")
+	require.Contains(t, executionErr.Error(), "plugin with name vscc wasn't found")
 }
 
 var signer msp.SigningIdentity
@@ -1301,7 +1247,14 @@ func TestMain(m *testing.M) {
 	msptesttools.LoadMSPSetupForTesting()
 
 	var err error
-	signer, err = mgmt.GetLocalMSP().GetDefaultSigningIdentity()
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	if err != nil {
+		fmt.Printf("Initialize cryptoProvider bccsp failed: %s", err)
+		os.Exit(-1)
+		return
+	}
+
+	signer, err = mgmt.GetLocalMSP(cryptoProvider).GetDefaultSigningIdentity()
 	if err != nil {
 		fmt.Println("Could not get signer")
 		os.Exit(-1)
@@ -1316,8 +1269,4 @@ func TestMain(m *testing.M) {
 	}
 
 	os.Exit(m.Run())
-}
-
-func ToHex(q uint64) string {
-	return "0x" + strconv.FormatUint(q, 16)
 }

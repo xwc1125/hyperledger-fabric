@@ -9,12 +9,12 @@ package mock
 import (
 	"time"
 
+	proto "github.com/hyperledger/fabric-protos-go/gossip"
 	"github.com/hyperledger/fabric/gossip/api"
 	"github.com/hyperledger/fabric/gossip/comm"
 	"github.com/hyperledger/fabric/gossip/common"
 	"github.com/hyperledger/fabric/gossip/protoext"
 	"github.com/hyperledger/fabric/gossip/util"
-	proto "github.com/hyperledger/fabric/protos/gossip"
 )
 
 // Mock which aims to simulate socket
@@ -133,6 +133,10 @@ func (mock *commMock) start() {
 			}
 		}
 	}
+}
+
+func (mock *commMock) IdentitySwitch() <-chan common.PKIidType {
+	panic("implement me")
 }
 
 // GetPKIid returns this instance's PKI id

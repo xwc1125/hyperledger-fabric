@@ -11,14 +11,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hyperledger/fabric-protos-go/gossip"
+	proto "github.com/hyperledger/fabric-protos-go/gossip"
 	"github.com/hyperledger/fabric/gossip/comm"
 	"github.com/hyperledger/fabric/gossip/common"
 	"github.com/hyperledger/fabric/gossip/discovery"
 	"github.com/hyperledger/fabric/gossip/gossip/algo"
 	"github.com/hyperledger/fabric/gossip/protoext"
 	"github.com/hyperledger/fabric/gossip/util"
-	"github.com/hyperledger/fabric/protos/gossip"
-	proto "github.com/hyperledger/fabric/protos/gossip"
 	"github.com/pkg/errors"
 	"go.uber.org/zap/zapcore"
 )
@@ -407,11 +407,7 @@ func (p *pullMediatorImpl) peersWithEndpoints(endpoints ...string) []*comm.Remot
 func (p *pullMediatorImpl) hooksByMsgType(msgType MsgType) []MessageHook {
 	p.RLock()
 	defer p.RUnlock()
-	returnedHooks := []MessageHook{}
-	for _, h := range p.msgType2Hook[msgType] {
-		returnedHooks = append(returnedHooks, h)
-	}
-	return returnedHooks
+	return append([]MessageHook(nil), p.msgType2Hook[msgType]...)
 }
 
 // SelectEndpoints select k peers from peerPool and returns them.

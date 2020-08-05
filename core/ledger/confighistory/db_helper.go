@@ -18,6 +18,7 @@ import (
 const (
 	keyPrefix     = "s"
 	separatorByte = byte(0)
+	nsStopper     = byte(1)
 )
 
 type compositeKey struct {
@@ -42,13 +43,17 @@ type batch struct {
 	*leveldbhelper.UpdateBatch
 }
 
-func newDBProvider(dbPath string) *dbProvider {
+func newDBProvider(dbPath string) (*dbProvider, error) {
 	logger.Debugf("Opening db for config history: db path = %s", dbPath)
-	return &dbProvider{leveldbhelper.NewProvider(&leveldbhelper.Conf{DBPath: dbPath})}
+	p, err := leveldbhelper.NewProvider(&leveldbhelper.Conf{DBPath: dbPath})
+	if err != nil {
+		return nil, err
+	}
+	return &dbProvider{Provider: p}, nil
 }
 
-func newBatch() *batch {
-	return &batch{leveldbhelper.NewUpdateBatch()}
+func (d *db) newBatch() *batch {
+	return &batch{d.DBHandle.NewUpdateBatch()}
 }
 
 func (p *dbProvider) getDB(id string) *db {
@@ -71,7 +76,10 @@ func (d *db) mostRecentEntryBelow(blockNum uint64, ns, key string) (*compositeKV
 		return nil, errors.New("blockNum should be greater than 0")
 	}
 	startKey := encodeCompositeKey(ns, key, blockNum-1)
-	itr := d.GetIterator(startKey, nil)
+	itr, err := d.GetIterator(startKey, nil)
+	if err != nil {
+		return nil, err
+	}
 	defer itr.Release()
 	if !itr.Next() {
 		logger.Debugf("Key no entry found. Returning nil")
@@ -93,6 +101,14 @@ func (d *db) entryAt(blockNum uint64, ns, key string) (*compositeKV, error) {
 	}
 	k, v := decodeCompositeKey(keyBytes), valBytes
 	return &compositeKV{k, v}, nil
+}
+
+func (d *db) getNamespaceIterator(ns string) (*leveldbhelper.Iterator, error) {
+	nsStartKey := []byte(keyPrefix + ns)
+	nsStartKey = append(nsStartKey, separatorByte)
+	nsEndKey := []byte(keyPrefix + ns)
+	nsEndKey = append(nsEndKey, nsStopper)
+	return d.GetIterator(nsStartKey, nsEndKey)
 }
 
 func encodeCompositeKey(ns, key string, blockNum uint64) []byte {

@@ -11,22 +11,28 @@ import (
 	"io/ioutil"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric-protos-go/peer"
+	"github.com/hyperledger/fabric/bccsp/sw"
 	"github.com/hyperledger/fabric/common/chaincode"
 	"github.com/hyperledger/fabric/core/common/ccprovider"
-	"github.com/hyperledger/fabric/protos/peer"
 	"github.com/pkg/errors"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestInstalledCCs(t *testing.T) {
 	tmpDir, hashes := setupDirectoryStructure(t)
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+
 	defer func() {
 		os.RemoveAll(tmpDir)
 	}()
+
 	testCases := []struct {
 		name              string
 		directory         string
@@ -80,7 +86,7 @@ func TestInstalledCCs(t *testing.T) {
 		{
 			name: "No permission on chaincode files",
 			ls:   ioutil.ReadDir,
-			extractCCFromPath: func(_ string, _ string, _ string) (ccprovider.CCPackage, error) {
+			extractCCFromPath: func(_ string, _ string, _ ccprovider.GetHasher) (ccprovider.CCPackage, error) {
 				return nil, errors.New("banana")
 			},
 			expected:      nil,
@@ -93,48 +99,34 @@ func TestInstalledCCs(t *testing.T) {
 	for _, test := range testCases {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
-			c := &ccprovider.CCInfoFSImpl{}
+			c := &ccprovider.CCInfoFSImpl{GetHasher: cryptoProvider}
 			res, err := c.ListInstalledChaincodes(path.Join(tmpDir, test.directory), test.ls, test.extractCCFromPath)
-			assert.Equal(t, test.expected, res)
+			require.Equal(t, test.expected, res)
 			if test.errorContains == "" {
-				assert.NoError(t, err)
+				require.NoError(t, err)
 			} else {
-				assert.Contains(t, err.Error(), test.errorContains)
+				require.Contains(t, err.Error(), test.errorContains)
 			}
 		})
 	}
 }
 
-func TestChaincodeData(t *testing.T) {
-	var cd ccprovider.ChaincodeDefinition
-	cd = &ccprovider.ChaincodeData{
-		Data:                []byte("Data"),
-		Escc:                "Escc",
-		Id:                  []byte("Id"),
-		InstantiationPolicy: []byte("InstantiationPolicy"),
-		Name:                "Name",
-		Policy:              []byte("Policy"),
-		Version:             "Version",
-		Vscc:                "Vscc",
-	}
+func TestSetGetChaincodeInstallPath(t *testing.T) {
+	tempDir, err := ioutil.TempDir("", "ccprovider")
+	require.NoError(t, err)
+	defer os.RemoveAll(tempDir)
 
-	assert.Equal(t, cd.CCName(), "Name")
-	assert.Equal(t, cd.CCVersion(), "Version")
-	assert.Equal(t, cd.Endorsement(), "Escc")
-	assert.Equal(t, cd.Hash(), []byte("Id"))
-	assert.Equal(t, cd.RequiresInit(), false)
-	pl, po := cd.Validation()
-	assert.Equal(t, pl, "Vscc")
-	assert.Equal(t, po, []byte("Policy"))
-}
-
-func TestGetChaincodeInstallPath(t *testing.T) {
-	c := &ccprovider.CCInfoFSImpl{}
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+	c := &ccprovider.CCInfoFSImpl{GetHasher: cryptoProvider}
 	installPath := c.GetChaincodeInstallPath()
 	defer ccprovider.SetChaincodesPath(installPath)
 
-	ccprovider.SetChaincodesPath("blahblah")
-	assert.Equal(t, "blahblah", c.GetChaincodeInstallPath())
+	path := filepath.Join(tempDir, "blahblah")
+	ccprovider.SetChaincodesPath(path)
+	require.DirExistsf(t, path, "expect %s to be created")
+
+	require.Equal(t, path, c.GetChaincodeInstallPath())
 }
 
 func setupDirectoryStructure(t *testing.T) (string, map[string][]byte) {
@@ -145,20 +137,20 @@ func setupDirectoryStructure(t *testing.T) (string, map[string][]byte) {
 	}
 	hashes := map[string][]byte{}
 	tmp, err := ioutil.TempDir("", "test-installed-cc")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	dir := path.Join(tmp, "empty")
-	assert.NoError(t, os.Mkdir(dir, 0755))
+	require.NoError(t, os.Mkdir(dir, 0755))
 	dir = path.Join(tmp, "nonempty")
-	assert.NoError(t, os.Mkdir(dir, 0755))
+	require.NoError(t, os.Mkdir(dir, 0755))
 	dir = path.Join(tmp, "nopermission")
-	assert.NoError(t, os.Mkdir(dir, 0755))
+	require.NoError(t, os.Mkdir(dir, 0755))
 	dir = path.Join(tmp, "nopermissionforfiles")
-	assert.NoError(t, os.Mkdir(dir, 0755))
+	require.NoError(t, os.Mkdir(dir, 0755))
 	noPermissionFile := path.Join(tmp, "nopermissionforfiles", "nopermission.1")
 	_, err = os.Create(noPermissionFile)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	dir = path.Join(tmp, "nonempty")
-	assert.NoError(t, os.Mkdir(path.Join(tmp, "nonempty", "directory"), 0755))
+	require.NoError(t, os.Mkdir(path.Join(tmp, "nonempty", "directory"), 0755))
 	for _, f := range files {
 		var name, ver string
 		parts := strings.SplitN(f, ".", 2)
@@ -167,7 +159,7 @@ func setupDirectoryStructure(t *testing.T) (string, map[string][]byte) {
 			ver = parts[1]
 		}
 		file, err := os.Create(path.Join(dir, f))
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		cds := &peer.ChaincodeDeploymentSpec{
 			ChaincodeSpec: &peer.ChaincodeSpec{
 				ChaincodeId: &peer.ChaincodeID{Name: name, Version: ver},

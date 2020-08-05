@@ -5,174 +5,155 @@ Prerequisites
 ~~~~~~~~~~~~~
 
 -  `Git client <https://git-scm.com/downloads>`__
--  `Go <https://golang.org/dl/>`__ - version 1.12.x
--  (macOS)
-   `Xcode <https://itunes.apple.com/us/app/xcode/id497799835?mt=12>`__
-   must be installed
--  `Docker <https://www.docker.com/get-docker>`__ - 17.06.2-ce or later
--  `Docker Compose <https://docs.docker.com/compose/>`__ - 1.14.0 or later
--  (macOS) you may need to install gnutar, as macOS comes with bsdtar
-   as the default, but the build uses some gnutar flags. You can use
-   Homebrew to install it as follows:
-
-::
-
-    brew install gnu-tar
-
--  (macOS) If you install gnutar, you should prepend the "gnubin"
-   directory to the $PATH environment variable with something like:
-
-::
-
-    export PATH=/usr/local/opt/gnu-tar/libexec/gnubin:$PATH
-
--  (macOS) `Libtool <https://www.gnu.org/software/libtool/>`__. You can use
-   Homebrew to install it as follows:
-
-::
-
-    brew install libtool
-
--  (only if using Vagrant) - `Vagrant <https://www.vagrantup.com/>`__ -
-   1.9 or later
--  (only if using Vagrant) -
-   `VirtualBox <https://www.virtualbox.org/>`__ - 5.0 or later
--  BIOS Enabled Virtualization - Varies based on hardware
-
--  Note: The BIOS Enabled Virtualization may be within the CPU or
-   Security settings of the BIOS
+-  `Go <https://golang.org/dl/>`__ version 1.14.x
+-  `Docker <https://docs.docker.com/get-docker/>`__ version 18.03 or later
+-  (macOS) `Xcode Command Line Tools <https://developer.apple.com/downloads/>`__
+-  `SoftHSM <https://github.com/opendnssec/SoftHSMv2>`__
+-  `jq <https://stedolan.github.io/jq/download/>`__
 
 
 Steps
 ~~~~~
 
-Set your GOPATH
-^^^^^^^^^^^^^^^
+Install the Prerequisites
+^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Make sure you have properly setup your Host's `GOPATH environment
-variable <https://github.com/golang/go/wiki/GOPATH>`__. This allows for
-both building within the Host and the VM.
+For macOS, we recommend using `Homebrew <https://brew.sh>`__ to manage the
+development prereqs. The Xcode command line tools will be installed as part of
+the Homebrew installation.
 
-In case you installed Go into a different location from the standard one
-your Go distribution assumes, make sure that you also set `GOROOT
-environment variable <https://golang.org/doc/install#install>`__.
-
-Note to Windows users
-^^^^^^^^^^^^^^^^^^^^^
-
-If you are running Windows, before running any ``git clone`` commands,
-run the following command.
+Once Homebrew is ready, installing the necessary prerequisites is very easy:
 
 ::
 
-    git config --get core.autocrlf
+    brew install git go jq softhsm
+    brew cask install --appdir="/Applications" docker
 
-If ``core.autocrlf`` is set to ``true``, you must set it to ``false`` by
-running
+Docker Desktop must be launched to complete the installation so be sure to open
+the application after installing it:
+
+::
+
+    open /Applications/Docker.app
+
+Developing on Windows
+~~~~~~~~~~~~~~~~~~~~~
+
+On Windows 10 you should use the native Docker distribution and you
+may use the Windows PowerShell. However, for the ``binaries``
+command to succeed you will still need to have the ``uname`` command
+available. You can get it as part of Git but beware that only the
+64bit version is supported.
+
+Before running any ``git clone`` commands, run the following commands:
 
 ::
 
     git config --global core.autocrlf false
+    git config --global core.longpaths true
 
-If you continue with ``core.autocrlf`` set to ``true``, the
-``vagrant up`` command will fail with the error:
+You can check the setting of these parameters with the following commands:
 
-``./setup.sh: /bin/bash^M: bad interpreter: No such file or directory``
+::
 
-Configuring Gerrit to Use SSH
+    git config --get core.autocrlf
+    git config --get core.longpaths
+
+These need to be ``false`` and ``true`` respectively.
+
+The ``curl`` command that comes with Git and Docker Toolbox is old and
+does not handle properly the redirect used in
+:doc:`../getting_started`. Make sure you have and use a newer version
+which can be downloaded from the `cURL downloads page
+<https://curl.haxx.se/download.html>`__
+
+Clone the Hyperledger Fabric source
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+First navigate to https://github.com/hyperledger/fabric and fork the fabric
+repository using the fork button in the top-right corner. After forking, clone
+the repository.
+
+::
+
+    mkdir -p github.com/<your_github_userid>
+    cd github.com/<your_github_userid>
+    git clone https://github.com/<your_github_userid>/fabric
+
+.. note::
+    If you are running Windows, before cloning the repository, run the following
+    command:
+
+    ::
+
+        git config --get core.autocrlf
+
+    If ``core.autocrlf`` is set to ``true``, you must set it to ``false`` by
+    running:
+
+    ::
+
+        git config --global core.autocrlf false
+
+
+Configure SoftHSM
+^^^^^^^^^^^^^^^^^
+
+A PKCS #11 cryptographic token implementation is required to run the unit
+tests. The PKCS #11 API is used by the bccsp component of Fabric to interact
+with hardware security modules (HSMs) that store cryptographic information and
+perform cryptographic computations.  For test environments, SoftHSM can be used
+to satisfy this requirement.
+
+SoftHSM generally requires additional configuration before it can be used. For
+example, the default configuration will attempt to store token data in a system
+directory that unprivileged users are unable to write to.
+
+SoftHSM configuration typically involves copying ``/etc/softhsm2.conf`` to
+``$HOME/.config/softhsm2/softhsm2.conf`` and changing ``directories.tokendir``
+to an appropriate location. Please see the man page for ``softhsm2.conf`` for
+details.
+
+After SoftHSM has been configured, the following command can be used to
+initialize the token required by the unit tests:
+
+::
+
+    softhsm2-util --init-token --slot 0 --label "ForFabric" --so-pin 1234 --pin 98765432
+
+If tests are unable to locate the libsofthsm2.so library in your environment,
+specify the library path, the PIN, and the label of your token in the
+appropriate environment variables. For example, on macOS:
+
+::
+
+    export PKCS11_LIB="/usr/local/Cellar/softhsm/2.6.1/lib/softhsm/libsofthsm2.so"
+    export PKCS11_PIN=98765432
+    export PKCS11_LABEL="ForFabric"
+
+Install the development tools
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Gerrit uses SSH to interact with your Git client. If you already have an SSH
-key pair, you can skip the part of this section that explains how to generate one.
-
-What follows explains how to generate an SSH key pair in a Linux environment ---
-follow the equivalent steps on your OS.
-
-First, create an SSH key pair with the command:
+Once the repository is cloned, you can use ``make`` to install some of the
+tools used in the development environment. By default, these tools will be
+installed into ``$HOME/go/bin``. Please be sure your ``PATH`` includes that
+directory.
 
 ::
 
-    ssh-keygen -t rsa -C "John Doe john.doe@example.com"
+    make gotools
 
-**Note:** This will ask you for a password to protect the private key as
-it generates a unique key. Please keep this password private, and DO NOT
-enter a blank password.
-
-The generated SSH key pair can be found in the files ``~/.ssh/id_rsa`` and
-``~/.ssh/id_rsa.pub``.
-
-Next, add the private key in the ``id_rsa`` file to your key ring, e.g.:
+After installing the tools, the build environment can be verified by running a
+few commands.
 
 ::
 
-    ssh-add ~/.ssh/id_rsa
+    make basic-checks integration-test-prereqs
+    ginkgo -r ./integration/nwo
 
-Finally, add the public key of the generated key pair to the Gerrit server,
-with the following steps:
+If those commands completely successfully, you're ready to Go!
 
-1. Go to
-   `Gerrit <https://gerrit.hyperledger.org/r/#/admin/projects/fabric>`__.
-
-2. Click on your account name in the upper right corner.
-
-3. From the pop-up menu, select ``Settings``.
-
-4. On the left side menu, click on ``SSH Public Keys``.
-
-5. Paste the contents of your public key ``~/.ssh/id_rsa.pub`` and click
-   ``Add key``.
-
-**Note:** The ``id_rsa.pub`` file can be opened with any text editor.
-Ensure that all the contents of the file are selected, copied and pasted
-into the ``Add SSH key`` window in Gerrit.
-
-**Note:** The SSH key generation instructions operate on the assumption
-that you are using the default naming. It is possible to generate
-multiple SSH keys and to name the resulting files differently. See the
-`ssh-keygen <https://en.wikipedia.org/wiki/Ssh-keygen>`__ documentation
-for details on how to do that. Once you have generated non-default keys,
-you need to configure SSH to use the correct key for Gerrit. In that
-case, you need to create a ``~/.ssh/config`` file modeled after the one
-below.
-
-::
-
-    host gerrit.hyperledger.org
-     HostName gerrit.hyperledger.org
-     IdentityFile ~/.ssh/id_rsa_hyperledger_gerrit
-     User <LFID>
-
-where <LFID> is your Linux Foundation ID and the value of IdentityFile is the
-name of the public key file you generated.
-
-**Warning:** Potential Security Risk! Do not copy your private key
-``~/.ssh/id_rsa``. Use only the public ``~/.ssh/id_rsa.pub``.
-
-Cloning the Hyperledger Fabric source
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-Since Hyperledger Fabric is written in ``Go``, you'll need to
-clone the source repository to your $GOPATH/src directory. If your $GOPATH
-has multiple path components, then you will want to use the first one.
-There's a little bit of setup needed:
-
-::
-
-    cd $GOPATH/src
-    mkdir -p github.com/hyperledger
-    cd github.com/hyperledger
-
-Recall that we are using ``Gerrit`` for source control, which has its
-own internal git repositories. Hence, we will need to clone from
-:doc:`Gerrit <../Gerrit/gerrit>`.
-For brevity, the command is as follows:
-
-::
-
-    git clone ssh://LFID@gerrit.hyperledger.org:29418/fabric && scp -p -P 29418 LFID@gerrit.hyperledger.org:hooks/commit-msg fabric/.git/hooks/
-
-**Note:** Of course, you would want to replace ``LFID`` with your own
-Linux Foundation ID.
+If you plan to use the Hyperledger Fabric application SDKs then be sure to check out their prerequisites in the Node.js SDK `README <https://github.com/hyperledger/fabric-sdk-node#build-and-test>`__ and Java SDK `README <https://github.com/hyperledger/fabric-gateway-java/blob/master/README.md>`__.
 
 .. Licensed under Creative Commons Attribution 4.0 International License
    https://creativecommons.org/licenses/by/4.0/

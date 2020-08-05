@@ -7,11 +7,11 @@ SPDX-License-Identifier: Apache-2.0
 package consensus
 
 import (
+	cb "github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
 	"github.com/hyperledger/fabric/orderer/common/blockcutter"
 	"github.com/hyperledger/fabric/orderer/common/msgprocessor"
-	cb "github.com/hyperledger/fabric/protos/common"
 	"github.com/hyperledger/fabric/protoutil"
 )
 
@@ -24,6 +24,15 @@ type Consenter interface {
 	// the last block committed to the ledger of this Chain. For a new chain, or one which is migrated,
 	// this metadata will be nil (or contain a zero-length Value), as there is no prior metadata to report.
 	HandleChain(support ConsenterSupport, metadata *cb.Metadata) (Chain, error)
+}
+
+// ClusterConsenter defines methods implemented by cluster-type consenters.
+type ClusterConsenter interface {
+	// IsChannelMember inspects the join block and detects whether it implies that this orderer is a member of the
+	// channel. It returns true if the orderer is a member of the consenters set, and false if it is not. The method
+	// also inspects the consensus type metadata for validity. It returns an error if membership cannot be determined
+	// due to errors processing the block.
+	IsChannelMember(joinBlock *cb.Block) (bool, error)
 }
 
 // MetadataValidator performs the validation of updates to ConsensusMetadata during config updates to the channel.
@@ -113,11 +122,11 @@ type ConsenterSupport interface {
 	// WriteConfigBlock commits a block to the ledger, and applies the config update inside.
 	WriteConfigBlock(block *cb.Block, encodedMetadataValue []byte)
 
-	// Sequence returns the current config squence.
+	// Sequence returns the current config sequence.
 	Sequence() uint64
 
-	// ChainID returns the channel ID this support is associated with.
-	ChainID() string
+	// ChannelID returns the channel ID this support is associated with.
+	ChannelID() string
 
 	// Height returns the number of blocks in the chain this channel is associated with.
 	Height() uint64

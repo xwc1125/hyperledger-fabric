@@ -1,5 +1,6 @@
 /*
 Copyright IBM Corp. All Rights Reserved.
+
 SPDX-License-Identifier: Apache-2.0
 */
 
@@ -8,98 +9,93 @@ package ledgermgmt
 import (
 	"fmt"
 	"io/ioutil"
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/hyperledger/fabric/bccsp/sw"
 	"github.com/hyperledger/fabric/common/configtx/test"
 	"github.com/hyperledger/fabric/common/metrics/disabled"
-	"github.com/hyperledger/fabric/core/chaincode/platforms"
-	"github.com/hyperledger/fabric/core/chaincode/platforms/golang"
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/core/ledger/cceventmgmt"
 	"github.com/hyperledger/fabric/core/ledger/mock"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestLedgerMgmt(t *testing.T) {
-	// Check for error when creating/opening ledger without initialization.
-	gb, _ := test.MakeGenesisBlock(constructTestLedgerID(0))
-	l, err := CreateLedger(gb)
-	assert.Nil(t, l)
-	assert.Equal(t, ErrLedgerMgmtNotInitialized, err)
-
-	ledgerID := constructTestLedgerID(2)
-	l, err = OpenLedger(ledgerID)
-	assert.Nil(t, l)
-	assert.Equal(t, ErrLedgerMgmtNotInitialized, err)
-
-	ids, err := GetLedgerIDs()
-	assert.Nil(t, ids)
-	assert.Equal(t, ErrLedgerMgmtNotInitialized, err)
-
-	Close()
-
-	rootPath, err := ioutil.TempDir("", "lgrmgmt")
+	testDir, err := ioutil.TempDir("", "ledgermgmt")
 	if err != nil {
 		t.Fatalf("Failed to create ledger directory: %s", err)
 	}
-
-	initializer := &Initializer{
-		PlatformRegistry: platforms.NewRegistry(&golang.Platform{}),
-		MetricsProvider:  &disabled.Provider{},
-		Config: &ledger.Config{
-			RootFSPath:    rootPath,
-			StateDBConfig: &ledger.StateDBConfig{},
-		},
-	}
-
-	cleanup, err := InitializeTestEnvWithInitializer(initializer)
+	initializer, err := constructDefaultInitializer(testDir)
 	if err != nil {
-		t.Fatalf("Failed to initialize test environment: %s", err)
+		t.Fatalf("Failed to create default initializer: %s", err)
 	}
-	defer cleanup()
+
+	ledgerMgr := NewLedgerMgr(initializer)
+	defer func() {
+		os.RemoveAll(testDir)
+	}()
 
 	numLedgers := 10
 	ledgers := make([]ledger.PeerLedger, numLedgers)
 	for i := 0; i < numLedgers; i++ {
-		gb, _ := test.MakeGenesisBlock(constructTestLedgerID(i))
-		l, _ := CreateLedger(gb)
+		cid := constructTestLedgerID(i)
+		gb, _ := test.MakeGenesisBlock(cid)
+		l, err := ledgerMgr.CreateLedger(cid, gb)
+		require.NoError(t, err)
 		ledgers[i] = l
 	}
 
-	ids, _ = GetLedgerIDs()
-	assert.Len(t, ids, numLedgers)
+	ids, _ := ledgerMgr.GetLedgerIDs()
+	require.Len(t, ids, numLedgers)
 	for i := 0; i < numLedgers; i++ {
-		assert.Equal(t, constructTestLedgerID(i), ids[i])
+		require.Equal(t, constructTestLedgerID(i), ids[i])
 	}
 
-	ledgerID = constructTestLedgerID(2)
+	ledgerID := constructTestLedgerID(2)
 	t.Logf("Ledger selected for test = %s", ledgerID)
-	_, err = OpenLedger(ledgerID)
-	assert.Equal(t, ErrLedgerAlreadyOpened, err)
+	_, err = ledgerMgr.OpenLedger(ledgerID)
+	require.Equal(t, ErrLedgerAlreadyOpened, err)
 
-	l = ledgers[2]
+	l := ledgers[2]
 	l.Close()
-	l, err = OpenLedger(ledgerID)
-	assert.NoError(t, err)
+	// attempt to close the same ledger twice and ensure it doesn't panic
+	require.NotPanics(t, l.Close)
 
-	l, err = OpenLedger(ledgerID)
-	assert.Equal(t, ErrLedgerAlreadyOpened, err)
+	_, err = ledgerMgr.OpenLedger(ledgerID)
+	require.NoError(t, err)
 
+	_, err = ledgerMgr.OpenLedger(ledgerID)
+	require.Equal(t, ErrLedgerAlreadyOpened, err)
 	// close all opened ledgers and ledger mgmt
-	Close()
+	ledgerMgr.Close()
 
-	// Restart ledger mgmt with existing ledgers
-	Initialize(initializer)
-	l, err = OpenLedger(ledgerID)
-	assert.NoError(t, err)
-	Close()
+	// Recreate LedgerMgr with existing ledgers
+	ledgerMgr = NewLedgerMgr(initializer)
+	_, err = ledgerMgr.OpenLedger(ledgerID)
+	require.NoError(t, err)
+	ledgerMgr.Close()
 }
 
 func TestChaincodeInfoProvider(t *testing.T) {
-	cleanup := InitializeTestEnv(t)
-	defer cleanup()
+	testDir, err := ioutil.TempDir("", "ledgermgmt")
+	if err != nil {
+		t.Fatalf("Failed to create ledger directory: %s", err)
+	}
+	initializer, err := constructDefaultInitializer(testDir)
+	if err != nil {
+		t.Fatalf("Failed to create default initializer: %s", err)
+	}
+
+	ledgerMgr := NewLedgerMgr(initializer)
+	defer func() {
+		ledgerMgr.Close()
+		os.RemoveAll(testDir)
+	}()
+
 	gb, _ := test.MakeGenesisBlock("ledger1")
-	CreateLedger(gb)
+	ledgerMgr.CreateLedger("ledger1", gb)
 
 	mockDeployedCCInfoProvider := &mock.DeployedChaincodeInfoProvider{}
 	mockDeployedCCInfoProvider.ChaincodeInfoStub = func(channelName, ccName string, qe ledger.SimpleQueryExecutor) (*ledger.DeployedChaincodeInfo, error) {
@@ -107,24 +103,52 @@ func TestChaincodeInfoProvider(t *testing.T) {
 	}
 
 	ccInfoProvider := &chaincodeInfoProviderImpl{
-		platforms.NewRegistry(&golang.Platform{}),
+		ledgerMgr,
 		mockDeployedCCInfoProvider,
 	}
-	_, err := ccInfoProvider.GetDeployedChaincodeInfo("ledger2", constructTestCCDef("cc2", "1.0", "cc2Hash"))
+	_, err = ccInfoProvider.GetDeployedChaincodeInfo("ledger2", constructTestCCDef("cc2", "1.0", "cc2Hash"))
 	t.Logf("Expected error received = %s", err)
-	assert.Error(t, err)
+	require.Error(t, err)
 
 	ccInfo, err := ccInfoProvider.GetDeployedChaincodeInfo("ledger1", constructTestCCDef("cc1", "non-matching-version", "cc1"))
-	assert.NoError(t, err)
-	assert.Nil(t, ccInfo)
+	require.NoError(t, err)
+	require.Nil(t, ccInfo)
 
 	ccInfo, err = ccInfoProvider.GetDeployedChaincodeInfo("ledger1", constructTestCCDef("cc1", "cc1", "non-matching-hash"))
-	assert.NoError(t, err)
-	assert.Nil(t, ccInfo)
+	require.NoError(t, err)
+	require.Nil(t, ccInfo)
 
 	ccInfo, err = ccInfoProvider.GetDeployedChaincodeInfo("ledger1", constructTestCCDef("cc1", "cc1", "cc1"))
-	assert.NoError(t, err)
-	assert.Equal(t, constructTestCCInfo("cc1", "cc1", "cc1"), ccInfo)
+	require.NoError(t, err)
+	require.Equal(t, constructTestCCInfo("cc1", "cc1", "cc1"), ccInfo)
+}
+
+func constructDefaultInitializer(testDir string) (*Initializer, error) {
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	if err != nil {
+		return nil, err
+	}
+	return &Initializer{
+		Config: &ledger.Config{
+			RootFSPath:    testDir,
+			StateDBConfig: &ledger.StateDBConfig{},
+			PrivateDataConfig: &ledger.PrivateDataConfig{
+				MaxBatchSize:    5000,
+				BatchesInterval: 1000,
+				PurgeInterval:   100,
+			},
+			HistoryDBConfig: &ledger.HistoryDBConfig{
+				Enabled: true,
+			},
+			SnapshotsConfig: &ledger.SnapshotsConfig{
+				RootDir: filepath.Join(testDir, "snapshots"),
+			},
+		},
+
+		MetricsProvider:               &disabled.Provider{},
+		DeployedChaincodeInfoProvider: &mock.DeployedChaincodeInfoProvider{},
+		HashProvider:                  cryptoProvider,
+	}, nil
 }
 
 func constructTestLedgerID(i int) string {

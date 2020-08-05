@@ -9,9 +9,9 @@ package pvtdatastorage
 import (
 	"math"
 
+	"github.com/hyperledger/fabric-protos-go/ledger/rwset"
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/core/ledger/pvtdatapolicy"
-	"github.com/hyperledger/fabric/protos/ledger/rwset"
 	"github.com/willf/bitset"
 )
 
@@ -78,12 +78,16 @@ func prepareExpiryEntries(committingBlk uint64, dataEntries []*dataEntry, missin
 
 	// 1. prepare expiryData for non-missing data
 	for _, dataEntry := range dataEntries {
-		prepareExpiryEntriesForPresentData(mapByExpiringBlk, dataEntry.key, btlPolicy)
+		if err := prepareExpiryEntriesForPresentData(mapByExpiringBlk, dataEntry.key, btlPolicy); err != nil {
+			return nil, err
+		}
 	}
 
 	// 2. prepare expiryData for missing data
 	for missingDataKey := range missingDataEntries {
-		prepareExpiryEntriesForMissingData(mapByExpiringBlk, &missingDataKey, btlPolicy)
+		if err := prepareExpiryEntriesForMissingData(mapByExpiringBlk, &missingDataKey, btlPolicy); err != nil {
+			return nil, err
+		}
 	}
 
 	for expiryBlk, expiryData := range mapByExpiringBlk {

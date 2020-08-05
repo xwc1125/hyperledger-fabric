@@ -11,22 +11,24 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	docker "github.com/fsouza/go-dockerclient"
 	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric-protos-go/common"
+	"github.com/hyperledger/fabric-protos-go/msp"
+	protosorderer "github.com/hyperledger/fabric-protos-go/orderer"
+	"github.com/hyperledger/fabric-protos-go/orderer/etcdraft"
+	"github.com/hyperledger/fabric/common/crypto/tlsgen"
 	"github.com/hyperledger/fabric/integration/nwo"
 	"github.com/hyperledger/fabric/integration/nwo/commands"
+	"github.com/hyperledger/fabric/integration/ordererclient"
 	"github.com/hyperledger/fabric/internal/configtxgen/encoder"
-	"github.com/hyperledger/fabric/internal/configtxgen/localconfig"
-	"github.com/hyperledger/fabric/protos/common"
-	"github.com/hyperledger/fabric/protos/msp"
-	protosorderer "github.com/hyperledger/fabric/protos/orderer"
-	"github.com/hyperledger/fabric/protos/orderer/etcdraft"
+	"github.com/hyperledger/fabric/internal/configtxgen/genesisconfig"
 	"github.com/hyperledger/fabric/protoutil"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -34,7 +36,6 @@ import (
 	"github.com/onsi/gomega/gexec"
 	"github.com/tedsuo/ifrit"
 	"github.com/tedsuo/ifrit/ginkgomon"
-	"github.com/tedsuo/ifrit/grouper"
 )
 
 var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
@@ -54,7 +55,7 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 		ordererProcesses = nil
 
 		var err error
-		testDir, err = ioutil.TempDir("", "e2e-etcfraft_reconfig")
+		testDir, err = ioutil.TempDir("", "e2e-etcdraft_reconfig")
 		Expect(err).NotTo(HaveOccurred())
 
 		client, err = docker.NewClientFromEnv()
@@ -97,8 +98,7 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			orderer1 := network.Orderer("orderer1")
 			orderer2 := network.Orderer("orderer2")
 			orderer3 := network.Orderer("orderer3")
-			peer := network.Peer("Org1", "peer1")
-			org1Peer0 := network.Peer("Org1", "peer0")
+			peer := network.Peer("Org1", "peer0")
 			blockFile1 := filepath.Join(testDir, "newest_orderer1_block.pb")
 			blockFile2 := filepath.Join(testDir, "newest_orderer2_block.pb")
 			blockFile3 := filepath.Join(testDir, "newest_orderer3_block.pb")
@@ -117,7 +117,7 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 				if targetOrderer != nil {
 					c.Orderer = network.OrdererAddress(targetOrderer, nwo.ListenPort)
 				}
-				sess, err := network.PeerAdminSession(org1Peer0, c)
+				sess, err := network.PeerAdminSession(peer, c)
 				Expect(err).NotTo(HaveOccurred())
 				Eventually(sess, network.EventuallyTimeout).Should(gexec.Exit(0))
 			}
@@ -147,19 +147,21 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			network.GenerateConfigTree()
 			network.Bootstrap()
 
-			sysProfile := localconfig.Load(network.SystemChannel.Profile, network.RootDir)
+			sysProfile := genesisconfig.Load(network.SystemChannel.Profile, network.RootDir)
 			Expect(sysProfile.Orderer).NotTo(BeNil())
 			sysProfile.Orderer.EtcdRaft.Options.ElectionTick = sysProfile.Orderer.EtcdRaft.Options.HeartbeatTick
 			pgen := encoder.New(sysProfile)
 			genesisBlock := pgen.GenesisBlockForChannel(network.SystemChannel.Name)
 			data, err := proto.Marshal(genesisBlock)
 			Expect(err).NotTo(HaveOccurred())
-			ioutil.WriteFile(network.OutputBlockPath(network.SystemChannel.Name), data, 0644)
+			err = ioutil.WriteFile(network.OutputBlockPath(network.SystemChannel.Name), data, 0644)
+			Expect(err).NotTo(HaveOccurred())
 
 			By("Starting orderer with malformed genesis block")
 			ordererRunner := network.OrdererGroupRunner()
 			process := ifrit.Invoke(ordererRunner)
 			Eventually(process.Wait, network.EventuallyTimeout).Should(Receive()) // orderer process should exit
+			network.Cleanup()
 			os.RemoveAll(testDir)
 
 			By("Starting orderer with correct genesis block")
@@ -183,9 +185,9 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 
 			By("Creating malformed channel creation config tx")
 			channel := "testchannel"
-			sysProfile = localconfig.Load(network.SystemChannel.Profile, network.RootDir)
+			sysProfile = genesisconfig.Load(network.SystemChannel.Profile, network.RootDir)
 			Expect(sysProfile.Orderer).NotTo(BeNil())
-			appProfile := localconfig.Load(network.ProfileForChannel(channel), network.RootDir)
+			appProfile := genesisconfig.Load(network.ProfileForChannel(channel), network.RootDir)
 			Expect(appProfile).NotTo(BeNil())
 			o := *sysProfile.Orderer
 			appProfile.Orderer = &o
@@ -195,20 +197,21 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			Expect(err).NotTo(HaveOccurred())
 			data, err = proto.Marshal(configtx)
 			Expect(err).NotTo(HaveOccurred())
-			ioutil.WriteFile(network.CreateChannelTxPath(channel), data, 0644)
+			err = ioutil.WriteFile(network.CreateChannelTxPath(channel), data, 0644)
+			Expect(err).NotTo(HaveOccurred())
 
 			By("Submitting malformed channel creation config tx to orderer")
-			peer1org1 := network.Peer("Org1", "peer1")
-			peer1org2 := network.Peer("Org2", "peer1")
+			org1Peer0 := network.Peer("Org1", "peer0")
+			org2Peer0 := network.Peer("Org2", "peer0")
 
-			exitCode := network.CreateChannelExitCode(channel, orderer, peer1org1, peer1org1, peer1org2, orderer)
+			exitCode := network.CreateChannelExitCode(channel, orderer, org1Peer0, org1Peer0, org2Peer0, orderer)
 			Expect(exitCode).NotTo(Equal(0))
 			Consistently(process.Wait).ShouldNot(Receive()) // malformed tx should not crash orderer
 			Expect(runner.Err()).To(gbytes.Say(`invalid new config metdadata: ElectionTick \(10\) must be greater than HeartbeatTick \(10\)`))
 
 			By("Submitting channel config update with illegal value")
 			channel = network.SystemChannel.Name
-			config := nwo.GetConfig(network, peer1org1, orderer, channel)
+			config := nwo.GetConfig(network, org1Peer0, orderer, channel)
 			updatedConfig := proto.Clone(config).(*common.Config)
 
 			consensusTypeConfigValue := updatedConfig.ChannelGroup.Groups["Orderer"].Values["ConsensusType"]
@@ -230,32 +233,29 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 				Value:     protoutil.MarshalOrPanic(consensusTypeValue),
 			}
 
-			sess := nwo.UpdateOrdererConfigSession(network, orderer, channel, config, updatedConfig, peer1org1, orderer)
-			Expect(sess.ExitCode()).NotTo(Equal(0))
+			sess := nwo.UpdateOrdererConfigSession(network, orderer, channel, config, updatedConfig, org1Peer0, orderer)
+			Eventually(sess, network.EventuallyTimeout).Should(gexec.Exit(1))
 			Expect(sess.Err).To(gbytes.Say(`invalid new config metdadata: ElectionTick \(10\) must be greater than HeartbeatTick \(10\)`))
 		})
 	})
 
 	When("a single node cluster is expanded", func() {
-		It("is still possible to onboard the new cluster member", func() {
+		It("is still possible to onboard the new cluster member and then another one with a different TLS root CA", func() {
 			launch := func(o *nwo.Orderer) {
 				runner := network.OrdererRunner(o)
 				ordererRunners = append(ordererRunners, runner)
 
-				process := ifrit.Invoke(grouper.Member{Name: o.ID(), Runner: runner})
-				Eventually(process.Ready()).Should(BeClosed())
+				process := ifrit.Invoke(runner)
+				Eventually(process.Ready(), network.EventuallyTimeout).Should(BeClosed())
 				ordererProcesses = append(ordererProcesses, process)
 			}
 
-			layout := nwo.BasicEtcdRaft()
-
-			network = nwo.New(layout, testDir, client, StartPort(), components)
-			orderer := network.Orderer("orderer")
-
-			peer = network.Peer("Org1", "peer1")
-
+			network = nwo.New(nwo.BasicEtcdRaft(), testDir, client, StartPort(), components)
 			network.GenerateConfigTree()
 			network.Bootstrap()
+
+			orderer := network.Orderer("orderer")
+			peer = network.Peer("Org1", "peer0")
 
 			By("Launching the orderer")
 			launch(orderer)
@@ -282,11 +282,11 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Adding the second orderer")
-			nwo.AddConsenter(network, peer, orderer, "systemchannel", etcdraft.Consenter{
+			addConsenter(network, peer, orderer, "systemchannel", etcdraft.Consenter{
 				ServerTlsCert: secondOrdererCertificate,
 				ClientTlsCert: secondOrdererCertificate,
 				Host:          "127.0.0.1",
-				Port:          uint32(network.OrdererPort(orderer2, nwo.ListenPort)),
+				Port:          uint32(network.OrdererPort(orderer2, nwo.ClusterPort)),
 			})
 
 			By("Obtaining the last config block from the orderer")
@@ -297,12 +297,148 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			By("Waiting for the existing orderer to relinquish its leadership")
-			Eventually(ordererRunners[0].Err(), network.EventuallyTimeout, time.Second).Should(gbytes.Say("1 stepped down to follower since quorum is not active"))
-			Eventually(ordererRunners[0].Err(), network.EventuallyTimeout, time.Second).Should(gbytes.Say("No leader is present, cluster size is 2"))
+			Eventually(ordererRunners[0].Err(), network.EventuallyTimeout).Should(gbytes.Say("1 stepped down to follower since quorum is not active"))
+			Eventually(ordererRunners[0].Err(), network.EventuallyTimeout).Should(gbytes.Say("No leader is present, cluster size is 2"))
 			By("Launching the second orderer")
 			launch(orderer2)
 			By("Waiting for a leader to be re-elected")
 			findLeader(ordererRunners)
+
+			// In the next part of the test we're going to bring up a third node
+			// with a different TLS root CA. We're then going to remove the TLS
+			// root CA and restart the orderer, to ensure that we can dynamically
+			// update TLS root CAs in Raft while membership stays the same.
+
+			By("Creating configuration for a third orderer with a different TLS root CA")
+			orderer3 := &nwo.Orderer{
+				Name:         "orderer3",
+				Organization: "OrdererOrg",
+			}
+			ports = nwo.Ports{}
+			for _, portName := range nwo.OrdererPortNames() {
+				ports[portName] = network.ReservePort()
+			}
+			network.PortsByOrdererID[orderer3.ID()] = ports
+			network.Orderers = append(network.Orderers, orderer3)
+			network.GenerateOrdererConfig(orderer3)
+
+			tmpDir, err := ioutil.TempDir("", "e2e-etcfraft_reconfig")
+			Expect(err).NotTo(HaveOccurred())
+			defer os.RemoveAll(tmpDir)
+
+			sess, err := network.Cryptogen(commands.Generate{
+				Config: network.CryptoConfigPath(),
+				Output: tmpDir,
+			})
+			Expect(err).NotTo(HaveOccurred())
+			Eventually(sess, network.EventuallyTimeout).Should(gexec.Exit(0))
+
+			name := network.Orderers[0].Name
+			domain := network.Organization(network.Orderers[0].Organization).Domain
+			nameDomain := fmt.Sprintf("%s.%s", name, domain)
+			ordererTLSPath := filepath.Join(tmpDir, "ordererOrganizations", domain, "orderers", nameDomain, "tls")
+
+			caCertPath := filepath.Join(tmpDir, "ordererOrganizations", domain, "tlsca", fmt.Sprintf("tlsca.%s-cert.pem", domain))
+
+			caCert, err := ioutil.ReadFile(caCertPath)
+			Expect(err).NotTo(HaveOccurred())
+
+			thirdOrdererCertificatePath := filepath.Join(ordererTLSPath, "server.crt")
+			thirdOrdererCertificate, err := ioutil.ReadFile(thirdOrdererCertificatePath)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Updating it on the file system")
+			err = ioutil.WriteFile(caCertPath, caCert, 0644)
+			Expect(err).NotTo(HaveOccurred())
+			err = ioutil.WriteFile(thirdOrdererCertificatePath, thirdOrdererCertificate, 0644)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Overwriting the TLS directory of the new orderer")
+			for _, fileName := range []string{"server.crt", "server.key", "ca.crt"} {
+				dst := filepath.Join(network.OrdererLocalTLSDir(orderer3), fileName)
+
+				data, err := ioutil.ReadFile(filepath.Join(ordererTLSPath, fileName))
+				Expect(err).NotTo(HaveOccurred())
+
+				err = ioutil.WriteFile(dst, data, 0644)
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			By("Obtaining the last config block from the orderer once more to update the bootstrap file")
+			configBlock = nwo.GetConfigBlock(network, peer, orderer, "systemchannel")
+			err = ioutil.WriteFile(filepath.Join(testDir, "systemchannel_block.pb"), protoutil.MarshalOrPanic(configBlock), 0644)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Launching orderer3")
+			launch(orderer3)
+
+			By("Expanding the TLS root CA certificates")
+			nwo.UpdateOrdererMSP(network, peer, orderer, "systemchannel", "OrdererOrg", func(config msp.FabricMSPConfig) msp.FabricMSPConfig {
+				config.TlsRootCerts = append(config.TlsRootCerts, caCert)
+				return config
+			})
+
+			By("Adding orderer3 to the channel")
+			addConsenter(network, peer, orderer, "systemchannel", etcdraft.Consenter{
+				ServerTlsCert: thirdOrdererCertificate,
+				ClientTlsCert: thirdOrdererCertificate,
+				Host:          "127.0.0.1",
+				Port:          uint32(network.OrdererPort(orderer3, nwo.ClusterPort)),
+			})
+
+			By("Waiting for orderer3 to see the leader")
+			findLeader([]*ginkgomon.Runner{ordererRunners[2]})
+
+			By("Removing orderer3's TLS root CA certificate")
+			nwo.UpdateOrdererMSP(network, peer, orderer, "systemchannel", "OrdererOrg", func(config msp.FabricMSPConfig) msp.FabricMSPConfig {
+				config.TlsRootCerts = config.TlsRootCerts[:len(config.TlsRootCerts)-1]
+				return config
+			})
+
+			By("Killing orderer3")
+			o3Proc := ordererProcesses[2]
+			o3Proc.Signal(syscall.SIGKILL)
+			Eventually(o3Proc.Wait(), network.EventuallyTimeout).Should(Receive(MatchError("exit status 137")))
+
+			By("Restarting orderer3")
+			o3Runner := network.OrdererRunner(orderer3)
+			ordererRunners[2] = o3Runner
+			o3Proc = ifrit.Invoke(o3Runner)
+			Eventually(o3Proc.Ready(), network.EventuallyTimeout).Should(BeClosed())
+			ordererProcesses[2] = o3Proc
+
+			By("Ensuring TLS handshakes fail with the other orderers")
+			for i, oRunner := range ordererRunners {
+				if i < 2 {
+					Eventually(oRunner.Err(), network.EventuallyTimeout).Should(gbytes.Say("TLS handshake failed with error tls: failed to verify client certificate"))
+					continue
+				}
+				Eventually(oRunner.Err(), network.EventuallyTimeout).Should(gbytes.Say("TLS handshake failed with error remote error: tls: bad certificate"))
+				Eventually(oRunner.Err(), network.EventuallyTimeout).Should(gbytes.Say("Suspecting our own eviction from the channel"))
+			}
+
+			By("Attemping to add a consenter with invalid certs")
+			// create new certs that are not in the channel config
+			ca, err := tlsgen.NewCA()
+			Expect(err).NotTo(HaveOccurred())
+			client, err := ca.NewClientCertKeyPair()
+			Expect(err).NotTo(HaveOccurred())
+
+			current, updated := consenterAdder(
+				network,
+				peer,
+				orderer,
+				"systemchannel",
+				etcdraft.Consenter{
+					ServerTlsCert: client.Cert,
+					ClientTlsCert: client.Cert,
+					Host:          "127.0.0.1",
+					Port:          uint32(network.OrdererPort(orderer3, nwo.ListenPort)),
+				},
+			)
+			sess = nwo.UpdateOrdererConfigSession(network, orderer, network.SystemChannel.Name, current, updated, peer, orderer)
+			Eventually(sess, network.EventuallyTimeout).Should(gexec.Exit(1))
+			Expect(sess.Err).To(gbytes.Say(fmt.Sprintf("BAD_REQUEST -- error applying config update to existing channel 'systemchannel': consensus metadata update for channel config update is invalid: verifying tls client cert with serial number %d: x509: certificate signed by unknown authority", client.TLSCert.SerialNumber)))
 		})
 	})
 
@@ -310,13 +446,12 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 		It("is possible to rotate certificate by adding & removing cert in single config", func() {
 			layout := nwo.MultiNodeEtcdRaft()
 			network = nwo.New(layout, testDir, client, StartPort(), components)
-			o1, o2, o3 := network.Orderer("orderer1"), network.Orderer("orderer2"), network.Orderer("orderer3")
-			orderers := []*nwo.Orderer{o1, o2, o3}
-
-			peer = network.Peer("Org1", "peer1")
-
 			network.GenerateConfigTree()
 			network.Bootstrap()
+
+			o1, o2, o3 := network.Orderer("orderer1"), network.Orderer("orderer2"), network.Orderer("orderer3")
+			orderers := []*nwo.Orderer{o1, o2, o3}
+			peer = network.Peer("Org1", "peer0")
 
 			By("Launching the orderers")
 			for _, o := range orderers {
@@ -327,7 +462,7 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			}
 
 			for _, ordererProc := range ordererProcesses {
-				Eventually(ordererProc.Ready()).Should(BeClosed())
+				Eventually(ordererProc.Ready(), network.EventuallyTimeout).Should(BeClosed())
 			}
 
 			By("Finding leader")
@@ -345,7 +480,7 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			certificateRotations := refreshOrdererPEMs(network)
 
 			swap := func(o *nwo.Orderer, certificate []byte, c etcdraft.Consenter) {
-				nwo.UpdateEtcdRaftMetadata(network, peer, o, network.SystemChannel.Name, func(metadata *etcdraft.ConfigMetadata) {
+				updateEtcdRaftMetadata(network, peer, o, network.SystemChannel.Name, func(metadata *etcdraft.ConfigMetadata) {
 					var newConsenters []*etcdraft.Consenter
 					for _, consenter := range metadata.Consenters {
 						if bytes.Equal(consenter.ClientTlsCert, certificate) || bytes.Equal(consenter.ServerTlsCert, certificate) {
@@ -380,7 +515,7 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 					return ret
 				}()
 				submitterOrderer := network.Orderers[submitter]
-				port := network.OrdererPort(targetOrderer, nwo.ListenPort)
+				port := network.OrdererPort(targetOrderer, nwo.ClusterPort)
 
 				fmt.Fprintf(GinkgoWriter, "Rotating certificate of orderer node %d\n", target+1)
 				swap(submitterOrderer, rotation.oldCert, etcdraft.Consenter{
@@ -400,7 +535,7 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 					ChannelID:  network.SystemChannel.Name,
 					Block:      "newest",
 					OutputFile: "/dev/null",
-					Orderer:    network.OrdererAddress(targetOrderer, nwo.ListenPort),
+					Orderer:    network.OrdererAddress(targetOrderer, nwo.ClusterPort),
 				}
 				Eventually(func() string {
 					sess, err := network.OrdererAdminSession(targetOrderer, peer, c)
@@ -424,8 +559,8 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 				By("Starting the orderer again")
 				ordererRunner := network.OrdererRunner(targetOrderer)
 				ordererRunners = append(ordererRunners, ordererRunner)
-				ordererProcesses[target] = ifrit.Invoke(grouper.Member{Name: orderers[target].ID(), Runner: ordererRunner})
-				Eventually(ordererProcesses[target].Ready()).Should(BeClosed())
+				ordererProcesses[target] = ifrit.Invoke(ordererRunner)
+				Eventually(ordererProcesses[target].Ready(), network.EventuallyTimeout).Should(BeClosed())
 
 				By("And waiting for it to stabilize")
 				assertBlockReception(map[string]int{
@@ -442,7 +577,6 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 					rotate(i)
 				}
 			}
-
 		})
 
 		It("is still possible to onboard new orderers", func() {
@@ -479,13 +613,12 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			})
 
 			network = nwo.New(layout, testDir, client, StartPort(), components)
-			o1, o2, o3 := network.Orderer("orderer1"), network.Orderer("orderer2"), network.Orderer("orderer3")
-			orderers := []*nwo.Orderer{o1, o2, o3}
-
-			peer = network.Peer("Org1", "peer1")
-
 			network.GenerateConfigTree()
 			network.Bootstrap()
+
+			o1, o2, o3 := network.Orderer("orderer1"), network.Orderer("orderer2"), network.Orderer("orderer3")
+			orderers := []*nwo.Orderer{o1, o2, o3}
+			peer = network.Peer("Org1", "peer0")
 
 			By("Launching the orderers")
 			for _, o := range orderers {
@@ -496,7 +629,7 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			}
 
 			for _, ordererProc := range ordererProcesses {
-				Eventually(ordererProc.Ready()).Should(BeClosed())
+				Eventually(ordererProc.Ready(), network.EventuallyTimeout).Should(BeClosed())
 			}
 
 			By("Checking that all orderers are online")
@@ -526,11 +659,11 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 
 			for i, rotation := range certificateRotations {
 				o := network.Orderers[i]
-				port := network.OrdererPort(o, nwo.ListenPort)
+				port := network.OrdererPort(o, nwo.ClusterPort)
 
 				By(fmt.Sprintf("Adding the future certificate of orderer node %d", i))
 				for _, channelName := range []string{"systemchannel", "testchannel"} {
-					nwo.AddConsenter(network, peer, o, channelName, etcdraft.Consenter{
+					addConsenter(network, peer, o, channelName, etcdraft.Consenter{
 						ServerTlsCert: rotation.newCert,
 						ClientTlsCert: rotation.newCert,
 						Host:          "127.0.0.1",
@@ -548,15 +681,15 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 				By("Starting the orderer again")
 				ordererRunner := network.OrdererRunner(orderers[i])
 				ordererRunners = append(ordererRunners, ordererRunner)
-				ordererProcesses[i] = ifrit.Invoke(grouper.Member{Name: orderers[i].ID(), Runner: ordererRunner})
-				Eventually(ordererProcesses[i].Ready()).Should(BeClosed())
+				ordererProcesses[i] = ifrit.Invoke(ordererRunner)
+				Eventually(ordererProcesses[i].Ready(), network.EventuallyTimeout).Should(BeClosed())
 
 				By("And waiting for it to stabilize")
 				assertBlockReception(expectedBlockHeightsPerChannel[i*2], orderers, peer, network)
 
 				By("Removing the previous certificate of the old orderer")
 				for _, channelName := range []string{"systemchannel", "testchannel"} {
-					nwo.RemoveConsenter(network, peer, network.Orderers[(i+1)%len(network.Orderers)], channelName, rotation.oldCert)
+					removeConsenter(network, peer, network.Orderers[(i+1)%len(network.Orderers)], channelName, rotation.oldCert)
 				}
 
 				By("Waiting for all orderers to sync")
@@ -591,16 +724,15 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			network.GenerateOrdererConfig(network.Orderer("orderer4"))
 
 			By("Adding orderer4 to the channels")
-			orderer4CertificatePath := filepath.Join(testDir, "crypto", "ordererOrganizations", "example.com",
-				"orderers", "orderer4.example.com", "tls", "server.crt")
+			orderer4CertificatePath := filepath.Join(network.OrdererLocalTLSDir(o4), "server.crt")
 			orderer4Certificate, err := ioutil.ReadFile(orderer4CertificatePath)
 			Expect(err).NotTo(HaveOccurred())
 			for _, channel := range []string{"systemchannel", "testchannel"} {
-				nwo.AddConsenter(network, peer, o1, channel, etcdraft.Consenter{
+				addConsenter(network, peer, o1, channel, etcdraft.Consenter{
 					ServerTlsCert: orderer4Certificate,
 					ClientTlsCert: orderer4Certificate,
 					Host:          "127.0.0.1",
-					Port:          uint32(network.OrdererPort(o4, nwo.ListenPort)),
+					Port:          uint32(network.OrdererPort(o4, nwo.ClusterPort)),
 				})
 			}
 
@@ -612,7 +744,7 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 
 			By("Broadcasting envelope to testchannel")
 			env := CreateBroadcastEnvelope(network, peer, "testchannel", []byte("hello"))
-			resp, err := Broadcast(network, o1, env)
+			resp, err := ordererclient.Broadcast(network, o1, env)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(resp.Status).To(Equal(common.Status_SUCCESS))
 
@@ -634,8 +766,8 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			orderer4Runner := network.OrdererRunner(o4)
 			ordererRunners = append(ordererRunners, orderer4Runner)
 			// Spawn orderer4's process
-			o4process := ifrit.Invoke(grouper.Member{Name: o4.ID(), Runner: orderer4Runner})
-			Eventually(o4process.Ready()).Should(BeClosed())
+			o4process := ifrit.Invoke(orderer4Runner)
+			Eventually(o4process.Ready(), network.EventuallyTimeout).Should(BeClosed())
 			ordererProcesses = append(ordererProcesses, o4process)
 
 			By("And waiting for it to sync with the rest of the orderers")
@@ -646,24 +778,27 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 
 			By("Ensuring orderer4 doesn't serve testchannel2 and testchannel3")
 			env = CreateBroadcastEnvelope(network, peer, "testchannel2", []byte("hello"))
-			resp, err = Broadcast(network, o4, env)
+			resp, err = ordererclient.Broadcast(network, o4, env)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(resp.Status).To(Equal(common.Status_SERVICE_UNAVAILABLE))
 
 			env = CreateBroadcastEnvelope(network, peer, "testchannel3", []byte("hello"))
-			resp, err = Broadcast(network, o4, env)
+			resp, err = ordererclient.Broadcast(network, o4, env)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(resp.Status).To(Equal(common.Status_SERVICE_UNAVAILABLE))
 
-			Expect(string(orderer4Runner.Err().Contents())).To(ContainSubstring("I do not belong to channel testchannel2 or am forbidden pulling it (not in the channel), skipping chain retrieval"))
-			Expect(string(orderer4Runner.Err().Contents())).To(ContainSubstring("I do not belong to channel testchannel3 or am forbidden pulling it (forbidden pulling the channel), skipping chain retrieval"))
+			belongRegex := `\QI do not belong to channel testchannel2 or am forbidden pulling it (not in the channel), skipping chain retrieval\E`
+			forbiddenRegex := `\QI do not belong to channel testchannel3 or am forbidden pulling it (forbidden pulling the channel), skipping chain retrieval\E`
+
+			Expect(orderer4Runner.Err()).To(gbytes.Say(belongRegex + "|" + forbiddenRegex))
+			Expect(orderer4Runner.Err()).To(gbytes.Say(belongRegex + "|" + forbiddenRegex))
 
 			By("Adding orderer4 to testchannel2")
-			nwo.AddConsenter(network, peer, o1, "testchannel2", etcdraft.Consenter{
+			addConsenter(network, peer, o1, "testchannel2", etcdraft.Consenter{
 				ServerTlsCert: orderer4Certificate,
 				ClientTlsCert: orderer4Certificate,
 				Host:          "127.0.0.1",
-				Port:          uint32(network.OrdererPort(o4, nwo.ListenPort)),
+				Port:          uint32(network.OrdererPort(o4, nwo.ClusterPort)),
 			})
 
 			By("Waiting for orderer4 and to replicate testchannel2")
@@ -672,14 +807,11 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			}, []*nwo.Orderer{o4}, peer, network)
 
 			By("Ensuring orderer4 doesn't have any errors in the logs")
-			Expect(orderer4Runner.Err()).NotTo(gbytes.Say("ERRO"))
-
-			By("Ensuring that all orderers don't log errors to the log")
-			assertNoErrorsAreLogged(ordererRunners)
+			Consistently(orderer4Runner.Err()).ShouldNot(gbytes.Say("ERRO"))
 
 			By("Submitting a transaction through orderer4")
 			env = CreateBroadcastEnvelope(network, peer, "testchannel2", []byte("hello"))
-			resp, err = Broadcast(network, o4, env)
+			resp, err = ordererclient.Broadcast(network, o4, env)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(resp.Status).To(Equal(common.Status_SUCCESS))
 
@@ -705,13 +837,13 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 				BaseProfile: "SampleDevModeEtcdRaft",
 			})
 
-			peer = network.Peer("Org1", "peer1")
-
 			network.GenerateConfigTree()
 			network.Bootstrap()
 
 			o1, o2, o3 := network.Orderer("orderer1"), network.Orderer("orderer2"), network.Orderer("orderer3")
 			orderers := []*nwo.Orderer{o1, o2, o3}
+			peer = network.Peer("Org1", "peer0")
+
 			By("Launching the orderers")
 			for _, o := range orderers {
 				runner := network.OrdererRunner(o)
@@ -721,7 +853,7 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			}
 
 			for _, ordererProc := range ordererProcesses {
-				Eventually(ordererProc.Ready()).Should(BeClosed())
+				Eventually(ordererProc.Ready(), network.EventuallyTimeout).Should(BeClosed())
 			}
 
 			By("Waiting for the system channel to be available")
@@ -746,11 +878,11 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			ordererCertificate, err := ioutil.ReadFile(ordererCertificatePath)
 			Expect(err).NotTo(HaveOccurred())
 
-			nwo.AddConsenter(network, peer, o1, "mychannel", etcdraft.Consenter{
+			addConsenter(network, peer, o1, "mychannel", etcdraft.Consenter{
 				ServerTlsCert: ordererCertificate,
 				ClientTlsCert: ordererCertificate,
 				Host:          "127.0.0.1",
-				Port:          uint32(network.OrdererPort(o2, nwo.ListenPort)),
+				Port:          uint32(network.OrdererPort(o2, nwo.ClusterPort)),
 			})
 
 			By("Waiting for orderer2 to join the channel")
@@ -762,11 +894,11 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			ordererCertificatePath = filepath.Join(network.OrdererLocalTLSDir(o3), "server.crt")
 			ordererCertificate, err = ioutil.ReadFile(ordererCertificatePath)
 			Expect(err).NotTo(HaveOccurred())
-			nwo.AddConsenter(network, peer, o1, "mychannel", etcdraft.Consenter{
+			addConsenter(network, peer, o1, "mychannel", etcdraft.Consenter{
 				ServerTlsCert: ordererCertificate,
 				ClientTlsCert: ordererCertificate,
 				Host:          "127.0.0.1",
-				Port:          uint32(network.OrdererPort(o3, nwo.ListenPort)),
+				Port:          uint32(network.OrdererPort(o3, nwo.ClusterPort)),
 			})
 
 			By("Waiting for orderer3 to join the channel")
@@ -776,20 +908,18 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 		})
 	})
 
-	When("an orderer node is evicted", func() {
+	When("orderer cluster is not healthy", func() {
+		var (
+			o1, o2 *nwo.Orderer
+		)
+
 		BeforeEach(func() {
-			ordererRunners = nil
-			ordererProcesses = nil
-
 			network = nwo.New(nwo.MultiNodeEtcdRaft(), testDir, client, StartPort(), components)
-
-			peer = network.Peer("Org1", "peer1")
-
 			network.GenerateConfigTree()
 			network.Bootstrap()
 
-			o1, o2, o3 := network.Orderer("orderer1"), network.Orderer("orderer2"), network.Orderer("orderer3")
-			orderers := []*nwo.Orderer{o1, o2, o3}
+			o1, o2 = network.Orderer("orderer1"), network.Orderer("orderer2")
+			orderers := []*nwo.Orderer{o1, o2}
 			By("Launching the orderers")
 			for _, o := range orderers {
 				runner := network.OrdererRunner(o)
@@ -799,7 +929,75 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			}
 
 			for _, ordererProc := range ordererProcesses {
-				Eventually(ordererProc.Ready()).Should(BeClosed())
+				Eventually(ordererProc.Ready(), network.EventuallyTimeout).Should(BeClosed())
+			}
+		})
+
+		AfterEach(func() {
+			for _, ordererInstance := range ordererProcesses {
+				ordererInstance.Signal(syscall.SIGTERM)
+				Eventually(ordererInstance.Wait(), network.EventuallyTimeout).Should(Receive())
+			}
+		})
+
+		It("refuses to reconfig if it results in quorum loss", func() {
+			By("Waiting for them to elect a leader")
+			findLeader(ordererRunners)
+
+			extendNetwork(network)
+			certificatesOfOrderers := refreshOrdererPEMs(network)
+
+			By("Removing alive node from 2/3 cluster")
+			peer := network.Peer("Org1", "peer0")
+			current, updated := consenterRemover(network, peer, o2, network.SystemChannel.Name, certificatesOfOrderers[1].oldCert)
+			Eventually(func() []byte {
+				sess := nwo.UpdateOrdererConfigSession(network, o2, network.SystemChannel.Name, current, updated, peer, o2)
+				Eventually(sess, network.EventuallyTimeout).Should(gexec.Exit(1))
+				return sess.Err.Contents()
+			}, network.EventuallyTimeout).Should(ContainSubstring("2 out of 3 nodes are alive, configuration will result in quorum loss"))
+
+			By("Adding node to 2/3 cluster")
+			current, updated = consenterAdder(
+				network,
+				peer,
+				o2,
+				network.SystemChannel.Name,
+				etcdraft.Consenter{
+					ServerTlsCert: certificatesOfOrderers[0].newCert,
+					ClientTlsCert: certificatesOfOrderers[0].newCert,
+					Host:          "127.0.0.1",
+					Port:          uint32(network.OrdererPort(o1, nwo.ListenPort)),
+				},
+			)
+			sess := nwo.UpdateOrdererConfigSession(network, o2, network.SystemChannel.Name, current, updated, peer, o2)
+			Eventually(sess, network.EventuallyTimeout).Should(gexec.Exit(1))
+			Expect(string(sess.Err.Contents())).To(ContainSubstring("2 out of 3 nodes are alive, configuration will result in quorum loss"))
+		})
+	})
+
+	When("an orderer node is evicted", func() {
+		BeforeEach(func() {
+			ordererRunners = nil
+			ordererProcesses = nil
+
+			network = nwo.New(nwo.MultiNodeEtcdRaft(), testDir, client, StartPort(), components)
+			network.GenerateConfigTree()
+			network.Bootstrap()
+
+			o1, o2, o3 := network.Orderer("orderer1"), network.Orderer("orderer2"), network.Orderer("orderer3")
+			orderers := []*nwo.Orderer{o1, o2, o3}
+			peer = network.Peer("Org1", "peer0")
+
+			By("Launching the orderers")
+			for _, o := range orderers {
+				runner := network.OrdererRunner(o, "FABRIC_LOGGING_SPEC=orderer.consensus.etcdraft=debug:info")
+				ordererRunners = append(ordererRunners, runner)
+				process := ifrit.Invoke(runner)
+				ordererProcesses = append(ordererProcesses, process)
+			}
+
+			for _, ordererProc := range ordererProcesses {
+				Eventually(ordererProc.Ready(), network.EventuallyTimeout).Should(BeClosed())
 			}
 		})
 
@@ -818,10 +1016,10 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			firstEvictedNode := findLeader(ordererRunners) - 1
 
 			By("Removing the leader from 3-node channel")
-			serverCertBytes, err := ioutil.ReadFile(filepath.Join(network.OrdererLocalTLSDir(orderers[firstEvictedNode]), "server.crt"))
+			server1CertBytes, err := ioutil.ReadFile(filepath.Join(network.OrdererLocalTLSDir(orderers[firstEvictedNode]), "server.crt"))
 			Expect(err).To(Not(HaveOccurred()))
 
-			nwo.RemoveConsenter(network, peer, network.Orderers[(firstEvictedNode+1)%3], "systemchannel", serverCertBytes)
+			removeConsenter(network, peer, network.Orderers[(firstEvictedNode+1)%3], "systemchannel", server1CertBytes)
 
 			var survivedOrdererRunners []*ginkgomon.Runner
 			for i := range orderers {
@@ -834,33 +1032,125 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 
 			secondEvictedNode := findLeader(survivedOrdererRunners) - 1
 
-			var surviver int
+			var survivor int
 			for i := range orderers {
 				if i != firstEvictedNode && i != secondEvictedNode {
-					surviver = i
+					survivor = i
 					break
 				}
 			}
 
-			fmt.Fprintln(GinkgoWriter, "Ensuring the evicted orderer stops rafting on channel", "systemchannel")
-			stopMSg := fmt.Sprintf("Raft node stopped channel=%s", "systemchannel")
-			Eventually(ordererRunners[firstEvictedNode].Err(), network.EventuallyTimeout, time.Second).Should(gbytes.Say(stopMSg))
+			const stopMsg = "Raft node stopped channel=systemchannel"
+			fmt.Fprintln(GinkgoWriter, "Ensuring the evicted orderer stops rafting on channel systemchannel")
+			Eventually(ordererRunners[firstEvictedNode].Err(), network.EventuallyTimeout, time.Second).Should(gbytes.Say(stopMsg))
 
 			By("Ensuring the evicted orderer now doesn't serve clients")
 			ensureEvicted(orderers[firstEvictedNode], peer, network, "systemchannel")
 
 			By("Removing the leader from 2-node channel")
-			serverCertBytes, err = ioutil.ReadFile(filepath.Join(network.OrdererLocalTLSDir(orderers[secondEvictedNode]), "server.crt"))
+			server2CertBytes, err := ioutil.ReadFile(filepath.Join(network.OrdererLocalTLSDir(orderers[secondEvictedNode]), "server.crt"))
 			Expect(err).To(Not(HaveOccurred()))
 
-			nwo.RemoveConsenter(network, peer, orderers[surviver], "systemchannel", serverCertBytes)
-			findLeader([]*ginkgomon.Runner{ordererRunners[surviver]})
+			removeConsenter(network, peer, orderers[survivor], "systemchannel", server2CertBytes)
+			findLeader([]*ginkgomon.Runner{ordererRunners[survivor]})
 
-			fmt.Fprintln(GinkgoWriter, "Ensuring the other orderer detect the eviction of the node on channel", "systemchannel")
-			Eventually(ordererRunners[secondEvictedNode].Err(), network.EventuallyTimeout, time.Second).Should(gbytes.Say(stopMSg))
+			fmt.Fprintln(GinkgoWriter, "Ensuring the other orderer detect the eviction of the node on channel systemchannel")
+			Eventually(ordererRunners[secondEvictedNode].Err(), network.EventuallyTimeout, time.Second).Should(gbytes.Say(stopMsg))
 
 			By("Ensuring the evicted orderer now doesn't serve clients")
 			ensureEvicted(orderers[secondEvictedNode], peer, network, "systemchannel")
+
+			By("Re-adding first evicted orderer")
+			addConsenter(network, peer, network.Orderers[survivor], "systemchannel", etcdraft.Consenter{
+				Host:          "127.0.0.1",
+				Port:          uint32(network.OrdererPort(orderers[firstEvictedNode], nwo.ClusterPort)),
+				ClientTlsCert: server1CertBytes,
+				ServerTlsCert: server1CertBytes,
+			})
+
+			By("Ensuring re-added orderer starts serving system channel")
+			assertBlockReception(map[string]int{
+				"systemchannel": 3,
+			}, []*nwo.Orderer{orderers[firstEvictedNode]}, peer, network)
+
+			env := CreateBroadcastEnvelope(network, orderers[secondEvictedNode], network.SystemChannel.Name, []byte("foo"))
+			resp, err := ordererclient.Broadcast(network, orderers[survivor], env)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(resp.Status).To(Equal(common.Status_SUCCESS))
+		})
+
+		When("an evicted node is added back while it's offline", func() {
+			It("can start with correct new raft id", func() {
+				o1 := network.Orderer("orderer1")
+				o2 := network.Orderer("orderer2")
+				o3 := network.Orderer("orderer3")
+
+				By("Waiting for them to elect a leader")
+				findLeader(ordererRunners)
+
+				By("Creating an application channel testchannel")
+				network.CreateChannel("testchannel", o1, peer)
+
+				assertBlockReception(map[string]int{
+					"testchannel":   0,
+					"systemchannel": 1,
+				}, []*nwo.Orderer{o1, o2, o3}, peer, network)
+
+				By("Killing the first orderer")
+				ordererProcesses[0].Signal(syscall.SIGTERM)
+				Eventually(ordererProcesses[0].Wait(), network.EventuallyTimeout).Should(Receive())
+
+				// We need to wait for stabilization, as we might have killed the leader OSN.
+				By("Waiting for the channel to stabilize after killing the orderer")
+				assertBlockReception(map[string]int{
+					"testchannel":   0,
+					"systemchannel": 1,
+				}, []*nwo.Orderer{o2, o3}, peer, network)
+
+				By("observing active nodes to shrink")
+				o2Runner := ordererRunners[1]
+				Eventually(o2Runner.Err(), network.EventuallyTimeout).Should(gbytes.Say("Current active nodes in cluster are: \\[2 3\\]"))
+
+				By("Removing the first orderer from the application channel")
+				server1CertBytes, err := ioutil.ReadFile(filepath.Join(network.OrdererLocalTLSDir(o1), "server.crt"))
+				Expect(err).To(Not(HaveOccurred()))
+				removeConsenter(network, peer, o2, "testchannel", server1CertBytes)
+
+				By("Adding the evicted orderer back to the application channel")
+				addConsenter(network, peer, o2, "testchannel", etcdraft.Consenter{
+					ServerTlsCert: server1CertBytes,
+					ClientTlsCert: server1CertBytes,
+					Host:          "127.0.0.1",
+					Port:          uint32(network.OrdererPort(o1, nwo.ClusterPort)),
+				})
+
+				By("Removing the first orderer from the application channel again")
+				removeConsenter(network, peer, o2, "testchannel", server1CertBytes)
+
+				By("Adding the evicted orderer back to the application channel again")
+				addConsenter(network, peer, o2, "testchannel", etcdraft.Consenter{
+					ServerTlsCert: server1CertBytes,
+					ClientTlsCert: server1CertBytes,
+					Host:          "127.0.0.1",
+					Port:          uint32(network.OrdererPort(o1, nwo.ClusterPort)),
+				})
+
+				By("Starting the first orderer again")
+				o1Runner := network.OrdererRunner(o1)
+				ordererProcesses[0] = ifrit.Invoke(o1Runner)
+				Eventually(ordererProcesses[0].Ready(), network.EventuallyTimeout).Should(BeClosed())
+
+				By("Submitting tx")
+				env := CreateBroadcastEnvelope(network, o2, "testchannel", []byte("foo"))
+				resp, err := ordererclient.Broadcast(network, o2, env)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(resp.Status).To(Equal(common.Status_SUCCESS))
+
+				By("Waiting for the channel to stabilize")
+				assertBlockReception(map[string]int{
+					"testchannel": 5,
+				}, []*nwo.Orderer{o1, o2, o3}, peer, network)
+			})
 		})
 
 		It("notices it even if it is down at the time of its eviction", func() {
@@ -893,22 +1183,15 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			}, []*nwo.Orderer{o2, o3}, peer, network)
 
 			By("Removing the first orderer from an application channel")
-			extendNetwork(network)
-			certificatesOfOrderers := refreshOrdererPEMs(network)
-			nwo.RemoveConsenter(network, peer, o2, "testchannel", certificatesOfOrderers[0].oldCert)
-
-			certPath := certificatesOfOrderers[0].dstFile
-			keyFile := strings.Replace(certPath, "server.crt", "server.key", -1)
-			err := ioutil.WriteFile(certPath, certificatesOfOrderers[0].oldCert, 0644)
-			Expect(err).To(Not(HaveOccurred()))
-			err = ioutil.WriteFile(keyFile, certificatesOfOrderers[0].oldKey, 0644)
-			Expect(err).To(Not(HaveOccurred()))
+			o1cert, err := ioutil.ReadFile(path.Join(network.OrdererLocalTLSDir(o1), "server.crt"))
+			Expect(err).ToNot(HaveOccurred())
+			removeConsenter(network, peer, o2, "testchannel", o1cert)
 
 			By("Starting the orderer again")
 			ordererRunner := network.OrdererRunner(orderers[0])
 			ordererRunners[0] = ordererRunner
-			ordererProcesses[0] = ifrit.Invoke(grouper.Member{Name: orderers[0].ID(), Runner: ordererRunner})
-			Eventually(ordererProcesses[0].Ready()).Should(BeClosed())
+			ordererProcesses[0] = ifrit.Invoke(ordererRunner)
+			Eventually(ordererProcesses[0].Ready(), network.EventuallyTimeout).Should(BeClosed())
 
 			By("Ensuring the remaining OSNs reject authentication")
 			Eventually(ordererRunners[1].Err(), time.Minute, time.Second).Should(gbytes.Say("certificate extracted from TLS connection isn't authorized"))
@@ -929,8 +1212,8 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			By("Starting the evicted orderer again")
 			ordererRunner = network.OrdererRunner(orderers[0])
 			ordererRunners[0] = ordererRunner
-			ordererProcesses[0] = ifrit.Invoke(grouper.Member{Name: orderers[0].ID(), Runner: ordererRunner})
-			Eventually(ordererProcesses[0].Ready()).Should(BeClosed())
+			ordererProcesses[0] = ifrit.Invoke(ordererRunner)
+			Eventually(ordererProcesses[0].Ready(), network.EventuallyTimeout).Should(BeClosed())
 
 			By("Ensuring the evicted orderer starts up marked the channel is inactive")
 			Eventually(ordererRunner.Err(), time.Minute, time.Second).Should(gbytes.Say("Found 1 inactive chains"))
@@ -939,11 +1222,11 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			Eventually(ordererRunner.Err(), time.Minute, time.Second).Should(gbytes.Say(iDoNotBelong))
 
 			By("Adding the evicted orderer back to the application channel")
-			nwo.AddConsenter(network, peer, o2, "testchannel", etcdraft.Consenter{
-				ServerTlsCert: certificatesOfOrderers[0].oldCert,
-				ClientTlsCert: certificatesOfOrderers[0].oldCert,
+			addConsenter(network, peer, o2, "testchannel", etcdraft.Consenter{
+				ServerTlsCert: o1cert,
+				ClientTlsCert: o1cert,
 				Host:          "127.0.0.1",
-				Port:          uint32(network.OrdererPort(orderers[0], nwo.ListenPort)),
+				Port:          uint32(network.OrdererPort(orderers[0], nwo.ClusterPort)),
 			})
 
 			By("Ensuring the re-added orderer joins the Raft cluster")
@@ -989,7 +1272,7 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			network.GenerateConfigTree()
 			network.Bootstrap()
 
-			peer = network.Peer("Org1", "peer1")
+			peer = network.Peer("Org1", "peer0")
 
 			launch := func(i int) {
 				runner := network.OrdererRunner(orderers[i])
@@ -1040,11 +1323,11 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 				ordererCertificate, err := ioutil.ReadFile(ordererCertificatePath)
 				Expect(err).NotTo(HaveOccurred())
 
-				nwo.AddConsenter(network, peer, orderers[0], "systemchannel", etcdraft.Consenter{
+				addConsenter(network, peer, orderers[0], "systemchannel", etcdraft.Consenter{
 					ServerTlsCert: ordererCertificate,
 					ClientTlsCert: ordererCertificate,
 					Host:          "127.0.0.1",
-					Port:          uint32(network.OrdererPort(orderers[i], nwo.ListenPort)),
+					Port:          uint32(network.OrdererPort(orderers[i], nwo.ClusterPort)),
 				})
 				blockSeq++
 
@@ -1083,7 +1366,7 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 			}
 
 			env := CreateBroadcastEnvelope(network, orderers[4], network.SystemChannel.Name, []byte("hello"))
-			resp, err := Broadcast(network, orderers[4], env)
+			resp, err := ordererclient.Broadcast(network, orderers[4], env)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(resp.Status).To(Equal(common.Status_SUCCESS))
 			blockSeq++
@@ -1144,7 +1427,7 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 		network = nwo.New(config, testDir, client, StartPort(), components)
 		o1, o2, o3 := network.Orderer("orderer1"), network.Orderer("orderer2"), network.Orderer("orderer3")
 		orderers := []*nwo.Orderer{o1, o2, o3}
-		peer = network.Peer("Org1", "peer1")
+		peer = network.Peer("Org1", "peer0")
 
 		network.GenerateConfigTree()
 		network.Bootstrap()
@@ -1158,11 +1441,11 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 		}
 
 		for _, ordererProc := range ordererProcesses {
-			Eventually(ordererProc.Ready()).Should(BeClosed())
+			Eventually(ordererProc.Ready(), network.EventuallyTimeout).Should(BeClosed())
 		}
 
 		By("Creating an application channel with a subset of orderers in system channel")
-		additionalPeer := network.Peer("Org2", "peer1")
+		additionalPeer := network.Peer("Org2", "peer0")
 		network.CreateChannel("single-orderer-channel", network.Orderers[0], peer, additionalPeer, network.Orderers[0])
 
 		By("Creating another channel via the orderer that is in system channel but not app channel")
@@ -1186,13 +1469,13 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 		}
 
 		for _, ordererProc := range ordererProcesses {
-			Eventually(ordererProc.Ready()).Should(BeClosed())
+			Eventually(ordererProc.Ready(), network.EventuallyTimeout).Should(BeClosed())
 		}
 
 		By("Waiting for system channel to be ready")
 		findLeader(ordererRunners)
 
-		peer := network.Peer("Org1", "peer1")
+		peer := network.Peer("Org1", "peer0")
 		channel := "systemchannel"
 
 		config := nwo.GetConfig(network, peer, o1, channel)
@@ -1200,10 +1483,12 @@ var _ = Describe("EndToEnd reconfiguration and onboarding", func() {
 
 		ordererOrg := updatedConfig.ChannelGroup.Groups["Orderer"].Groups["OrdererOrg"]
 		mspConfig := &msp.MSPConfig{}
-		proto.Unmarshal(ordererOrg.Values["MSP"].Value, mspConfig)
+		err := proto.Unmarshal(ordererOrg.Values["MSP"].Value, mspConfig)
+		Expect(err).NotTo(HaveOccurred())
 
 		fabMSPConfig := &msp.FabricMSPConfig{}
-		proto.Unmarshal(mspConfig.Config, fabMSPConfig)
+		err = proto.Unmarshal(mspConfig.Config, fabMSPConfig)
+		Expect(err).NotTo(HaveOccurred())
 
 		fabMSPConfig.Name = "OrdererMSP2"
 
@@ -1374,30 +1659,11 @@ func refreshOrdererPEMs(n *nwo.Network) []*certificateChange {
 
 // assertBlockReception asserts that the given orderers have expected heights for the given channel--> height mapping
 func assertBlockReception(expectedHeightsPerChannel map[string]int, orderers []*nwo.Orderer, p *nwo.Peer, n *nwo.Network) {
-	assertReception := func(channelName string, blockSeq int) {
-		var wg sync.WaitGroup
-		wg.Add(len(orderers))
-		for _, orderer := range orderers {
-			go func(orderer *nwo.Orderer) {
-				defer GinkgoRecover()
-				defer wg.Done()
-				waitForBlockReception(orderer, p, n, channelName, blockSeq)
-			}(orderer)
-		}
-		wg.Wait()
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(len(expectedHeightsPerChannel))
-
 	for channelName, blockSeq := range expectedHeightsPerChannel {
-		go func(channelName string, blockSeq int) {
-			defer GinkgoRecover()
-			defer wg.Done()
-			assertReception(channelName, blockSeq)
-		}(channelName, blockSeq)
+		for _, orderer := range orderers {
+			waitForBlockReception(orderer, p, n, channelName, blockSeq)
+		}
 	}
-	wg.Wait()
 }
 
 func waitForBlockReception(o *nwo.Orderer, submitter *nwo.Peer, network *nwo.Network, channelName string, blockSeq int) {
@@ -1423,40 +1689,6 @@ func waitForBlockReception(o *nwo.Orderer, submitter *nwo.Peer, network *nwo.Net
 	}, network.EventuallyTimeout, time.Second).Should(BeEmpty())
 }
 
-func assertNoErrorsAreLogged(ordererRunners []*ginkgomon.Runner) {
-	var wg sync.WaitGroup
-	wg.Add(len(ordererRunners))
-
-	assertNoErrors := func(runner *ginkgomon.Runner) {
-		buff := runner.Err()
-		readOutput := func() string {
-			out := bytes.Buffer{}
-			// Read until no new input is detected
-			for {
-				b := make([]byte, 1024)
-				n, _ := buff.Read(b)
-				if n == 0 {
-					break
-				}
-				bytesRead := make([]byte, n)
-				copy(bytesRead, b)
-				out.Write(bytesRead)
-			}
-			return out.String()
-		}
-		Eventually(readOutput, time.Minute, time.Second*5).Should(Not(ContainSubstring("ERRO")))
-	}
-
-	for _, runner := range ordererRunners {
-		go func(runner *ginkgomon.Runner) {
-			defer GinkgoRecover()
-			defer wg.Done()
-			assertNoErrors(runner)
-		}(runner)
-	}
-	wg.Wait()
-}
-
 func revokeReaderAccess(network *nwo.Network, channel string, orderer *nwo.Orderer, peer *nwo.Peer) {
 	config := nwo.GetConfig(network, peer, orderer, channel)
 	updatedConfig := proto.Clone(config).(*common.Config)
@@ -1468,4 +1700,106 @@ func revokeReaderAccess(network *nwo.Network, channel string, orderer *nwo.Order
 	})
 	updatedConfig.ChannelGroup.Groups["Orderer"].Policies["Readers"].Policy.Value = adminPolicy
 	nwo.UpdateOrdererConfig(network, orderer, channel, config, updatedConfig, peer, orderer)
+}
+
+// consenterAdder constructs configs that can be used by `UpdateOrdererConfig`
+// to add a consenter.
+func consenterAdder(n *nwo.Network, peer *nwo.Peer, orderer *nwo.Orderer, channel string, consenter etcdraft.Consenter) (current, updated *common.Config) {
+	config := nwo.GetConfig(n, peer, orderer, channel)
+	updatedConfig := proto.Clone(config).(*common.Config)
+
+	consensusTypeConfigValue := updatedConfig.ChannelGroup.Groups["Orderer"].Values["ConsensusType"]
+	consensusTypeValue := &protosorderer.ConsensusType{}
+	err := proto.Unmarshal(consensusTypeConfigValue.Value, consensusTypeValue)
+	Expect(err).NotTo(HaveOccurred())
+
+	metadata := &etcdraft.ConfigMetadata{}
+	err = proto.Unmarshal(consensusTypeValue.Metadata, metadata)
+	Expect(err).NotTo(HaveOccurred())
+
+	metadata.Consenters = append(metadata.Consenters, &consenter)
+
+	consensusTypeValue.Metadata, err = proto.Marshal(metadata)
+	Expect(err).NotTo(HaveOccurred())
+
+	updatedConfig.ChannelGroup.Groups["Orderer"].Values["ConsensusType"] = &common.ConfigValue{
+		ModPolicy: "Admins",
+		Value:     protoutil.MarshalOrPanic(consensusTypeValue),
+	}
+
+	return config, updatedConfig
+}
+
+// consenterRemover constructs configs that can be used by
+// `UpdateOrdererConfig` to remove a consenter.
+func consenterRemover(n *nwo.Network, peer *nwo.Peer, orderer *nwo.Orderer, channel string, certificate []byte) (current, updated *common.Config) {
+	config := nwo.GetConfig(n, peer, orderer, channel)
+	updatedConfig := proto.Clone(config).(*common.Config)
+
+	consensusTypeConfigValue := updatedConfig.ChannelGroup.Groups["Orderer"].Values["ConsensusType"]
+	consensusTypeValue := &protosorderer.ConsensusType{}
+	err := proto.Unmarshal(consensusTypeConfigValue.Value, consensusTypeValue)
+	Expect(err).NotTo(HaveOccurred())
+
+	metadata := &etcdraft.ConfigMetadata{}
+	err = proto.Unmarshal(consensusTypeValue.Metadata, metadata)
+	Expect(err).NotTo(HaveOccurred())
+
+	var newConsenters []*etcdraft.Consenter
+	for _, consenter := range metadata.Consenters {
+		if bytes.Equal(consenter.ClientTlsCert, certificate) || bytes.Equal(consenter.ServerTlsCert, certificate) {
+			continue
+		}
+		newConsenters = append(newConsenters, consenter)
+	}
+
+	metadata.Consenters = newConsenters
+	consensusTypeValue.Metadata, err = proto.Marshal(metadata)
+	Expect(err).NotTo(HaveOccurred())
+
+	updatedConfig.ChannelGroup.Groups["Orderer"].Values["ConsensusType"] = &common.ConfigValue{
+		ModPolicy: "Admins",
+		Value:     protoutil.MarshalOrPanic(consensusTypeValue),
+	}
+
+	return config, updatedConfig
+}
+
+// addConsenter adds a new consenter to the given channel.
+func addConsenter(n *nwo.Network, peer *nwo.Peer, orderer *nwo.Orderer, channel string, consenter etcdraft.Consenter) {
+	updateEtcdRaftMetadata(n, peer, orderer, channel, func(metadata *etcdraft.ConfigMetadata) {
+		metadata.Consenters = append(metadata.Consenters, &consenter)
+	})
+}
+
+// removeConsenter removes a consenter with the given certificate in PEM format
+// from the given channel.
+func removeConsenter(n *nwo.Network, peer *nwo.Peer, orderer *nwo.Orderer, channel string, certificate []byte) {
+	updateEtcdRaftMetadata(n, peer, orderer, channel, func(metadata *etcdraft.ConfigMetadata) {
+		var newConsenters []*etcdraft.Consenter
+		for _, consenter := range metadata.Consenters {
+			if bytes.Equal(consenter.ClientTlsCert, certificate) || bytes.Equal(consenter.ServerTlsCert, certificate) {
+				continue
+			}
+			newConsenters = append(newConsenters, consenter)
+		}
+
+		metadata.Consenters = newConsenters
+	})
+}
+
+// updateEtcdRaftMetadata executes a config update that updates the etcdraft
+// metadata according to the given function f.
+func updateEtcdRaftMetadata(network *nwo.Network, peer *nwo.Peer, orderer *nwo.Orderer, channel string, f func(md *etcdraft.ConfigMetadata)) {
+	nwo.UpdateConsensusMetadata(network, peer, orderer, channel, func(originalMetadata []byte) []byte {
+		metadata := &etcdraft.ConfigMetadata{}
+		err := proto.Unmarshal(originalMetadata, metadata)
+		Expect(err).NotTo(HaveOccurred())
+
+		f(metadata)
+
+		newMetadata, err := proto.Marshal(metadata)
+		Expect(err).NotTo(HaveOccurred())
+		return newMetadata
+	})
 }

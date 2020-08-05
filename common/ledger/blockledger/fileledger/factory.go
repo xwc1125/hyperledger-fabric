@@ -1,17 +1,7 @@
 /*
-Copyright IBM Corp. 2017 All Rights Reserved.
+Copyright IBM Corp. 2016 All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-                 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package fileledger
@@ -20,61 +10,88 @@ import (
 	"sync"
 
 	"github.com/hyperledger/fabric/common/ledger/blkstorage"
-	"github.com/hyperledger/fabric/common/ledger/blkstorage/fsblkstorage"
 	"github.com/hyperledger/fabric/common/ledger/blockledger"
 	"github.com/hyperledger/fabric/common/metrics"
 )
 
+//go:generate counterfeiter -o mock/block_store_provider.go --fake-name BlockStoreProvider . blockStoreProvider
+type blockStoreProvider interface {
+	Open(ledgerid string) (*blkstorage.BlockStore, error)
+	Drop(ledgerid string) error
+	List() ([]string, error)
+	Close()
+}
+
 type fileLedgerFactory struct {
-	blkstorageProvider blkstorage.BlockStoreProvider
+	blkstorageProvider blockStoreProvider
 	ledgers            map[string]blockledger.ReadWriter
 	mutex              sync.Mutex
 }
 
-// GetOrCreate gets an existing ledger (if it exists) or creates it if it does not
-func (flf *fileLedgerFactory) GetOrCreate(chainID string) (blockledger.ReadWriter, error) {
-	flf.mutex.Lock()
-	defer flf.mutex.Unlock()
+// GetOrCreate gets an existing ledger (if it exists) or creates it
+// if it does not.
+func (f *fileLedgerFactory) GetOrCreate(channelID string) (blockledger.ReadWriter, error) {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
 
-	key := chainID
 	// check cache
-	ledger, ok := flf.ledgers[key]
+	ledger, ok := f.ledgers[channelID]
 	if ok {
 		return ledger, nil
 	}
 	// open fresh
-	blockStore, err := flf.blkstorageProvider.OpenBlockStore(key)
+	blockStore, err := f.blkstorageProvider.Open(channelID)
 	if err != nil {
 		return nil, err
 	}
 	ledger = NewFileLedger(blockStore)
-	flf.ledgers[key] = ledger
+	f.ledgers[channelID] = ledger
 	return ledger, nil
 }
 
-// ChainIDs returns the chain IDs the factory is aware of
-func (flf *fileLedgerFactory) ChainIDs() []string {
-	chainIDs, err := flf.blkstorageProvider.List()
+// Remove removes an existing ledger and its indexes. This operation
+// is blocking.
+func (f *fileLedgerFactory) Remove(channelID string) error {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+
+	err := f.blkstorageProvider.Drop(channelID)
+	if err != nil {
+		return err
+	}
+
+	delete(f.ledgers, channelID)
+
+	return nil
+}
+
+// ChannelIDs returns the channel IDs the factory is aware of.
+func (f *fileLedgerFactory) ChannelIDs() []string {
+	channelIDs, err := f.blkstorageProvider.List()
 	if err != nil {
 		logger.Panic(err)
 	}
-	return chainIDs
+	return channelIDs
 }
 
-// Close releases all resources acquired by the factory
-func (flf *fileLedgerFactory) Close() {
-	flf.blkstorageProvider.Close()
+// Close releases all resources acquired by the factory.
+func (f *fileLedgerFactory) Close() {
+	f.blkstorageProvider.Close()
 }
 
 // New creates a new ledger factory
-func New(directory string, metricsProvider metrics.Provider) blockledger.Factory {
-	return &fileLedgerFactory{
-		blkstorageProvider: fsblkstorage.NewProvider(
-			fsblkstorage.NewConf(directory, -1),
-			&blkstorage.IndexConfig{
-				AttrsToIndex: []blkstorage.IndexableAttr{blkstorage.IndexableAttrBlockNum}},
-			metricsProvider,
-		),
-		ledgers: make(map[string]blockledger.ReadWriter),
+func New(directory string, metricsProvider metrics.Provider) (blockledger.Factory, error) {
+	p, err := blkstorage.NewProvider(
+		blkstorage.NewConf(directory, -1),
+		&blkstorage.IndexConfig{
+			AttrsToIndex: []blkstorage.IndexableAttr{blkstorage.IndexableAttrBlockNum}},
+		metricsProvider,
+	)
+	if err != nil {
+		return nil, err
 	}
+	return &fileLedgerFactory{
+		blkstorageProvider: p,
+		ledgers:            make(map[string]blockledger.ReadWriter),
+	}, nil
 }

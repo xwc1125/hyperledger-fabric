@@ -16,12 +16,14 @@ import (
 
 	"code.cloudfoundry.org/clock"
 	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric-protos-go/common"
+	"github.com/hyperledger/fabric-protos-go/orderer"
+	"github.com/hyperledger/fabric-protos-go/orderer/etcdraft"
+	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/orderer/common/cluster"
+	"github.com/hyperledger/fabric/orderer/common/types"
 	"github.com/hyperledger/fabric/orderer/consensus"
-	"github.com/hyperledger/fabric/protos/common"
-	"github.com/hyperledger/fabric/protos/orderer"
-	"github.com/hyperledger/fabric/protos/orderer/etcdraft"
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
 	"go.etcd.io/etcd/raft"
@@ -41,12 +43,12 @@ const (
 	// DefaultSnapshotCatchUpEntries is the default number of entries
 	// to preserve in memory when a snapshot is taken. This is for
 	// slow followers to catch up.
-	DefaultSnapshotCatchUpEntries = uint64(20)
+	DefaultSnapshotCatchUpEntries = uint64(4)
 
 	// DefaultSnapshotIntervalSize is the default snapshot interval. It is
 	// used if SnapshotIntervalSize is not provided in channel config options.
 	// It is needed to enforce snapshot being set.
-	DefaultSnapshotIntervalSize = 20 * MEGABYTE // 20 MB
+	DefaultSnapshotIntervalSize = 16 * MEGABYTE
 
 	// DefaultEvictionSuspicion is the threshold that a node will start
 	// suspecting its own eviction if it has been leaderless for this
@@ -146,6 +148,7 @@ type Chain struct {
 	channelID string
 
 	lastKnownLeader uint64
+	ActiveNodes     atomic.Value
 
 	submitC  chan *submit
 	applyC   chan apply
@@ -190,6 +193,10 @@ type Chain struct {
 	logger  *flogging.FabricLogger
 
 	periodicChecker *PeriodicCheck
+
+	haltCallback func()
+	// BCCSP instane
+	CryptoProvider bccsp.BCCSP
 }
 
 // NewChain constructs a chain object.
@@ -198,10 +205,13 @@ func NewChain(
 	opts Options,
 	conf Configurator,
 	rpc RPC,
+	cryptoProvider bccsp.BCCSP,
 	f CreateBlockPuller,
-	observeC chan<- raft.SoftState) (*Chain, error) {
+	haltCallback func(),
+	observeC chan<- raft.SoftState,
+) (*Chain, error) {
 
-	lg := opts.Logger.With("channel", support.ChainID(), "node", opts.RaftID)
+	lg := opts.Logger.With("channel", support.ChannelID(), "node", opts.RaftID)
 
 	fresh := !wal.Exist(opts.WALDir)
 	storage, err := CreateStorage(lg, opts.WALDir, opts.SnapDir, opts.MemoryStorage)
@@ -237,7 +247,7 @@ func NewChain(
 	c := &Chain{
 		configurator:     conf,
 		rpc:              rpc,
-		channelID:        support.ChainID(),
+		channelID:        support.ChannelID(),
 		raftID:           opts.RaftID,
 		submitC:          make(chan *submit),
 		applyC:           make(chan apply),
@@ -257,24 +267,28 @@ func NewChain(
 		confState:        cc,
 		createPuller:     f,
 		clock:            opts.Clock,
+		haltCallback:     haltCallback,
 		Metrics: &Metrics{
-			ClusterSize:             opts.Metrics.ClusterSize.With("channel", support.ChainID()),
-			IsLeader:                opts.Metrics.IsLeader.With("channel", support.ChainID()),
-			CommittedBlockNumber:    opts.Metrics.CommittedBlockNumber.With("channel", support.ChainID()),
-			SnapshotBlockNumber:     opts.Metrics.SnapshotBlockNumber.With("channel", support.ChainID()),
-			LeaderChanges:           opts.Metrics.LeaderChanges.With("channel", support.ChainID()),
-			ProposalFailures:        opts.Metrics.ProposalFailures.With("channel", support.ChainID()),
-			DataPersistDuration:     opts.Metrics.DataPersistDuration.With("channel", support.ChainID()),
-			NormalProposalsReceived: opts.Metrics.NormalProposalsReceived.With("channel", support.ChainID()),
-			ConfigProposalsReceived: opts.Metrics.ConfigProposalsReceived.With("channel", support.ChainID()),
+			ClusterSize:             opts.Metrics.ClusterSize.With("channel", support.ChannelID()),
+			IsLeader:                opts.Metrics.IsLeader.With("channel", support.ChannelID()),
+			ActiveNodes:             opts.Metrics.ActiveNodes.With("channel", support.ChannelID()),
+			CommittedBlockNumber:    opts.Metrics.CommittedBlockNumber.With("channel", support.ChannelID()),
+			SnapshotBlockNumber:     opts.Metrics.SnapshotBlockNumber.With("channel", support.ChannelID()),
+			LeaderChanges:           opts.Metrics.LeaderChanges.With("channel", support.ChannelID()),
+			ProposalFailures:        opts.Metrics.ProposalFailures.With("channel", support.ChannelID()),
+			DataPersistDuration:     opts.Metrics.DataPersistDuration.With("channel", support.ChannelID()),
+			NormalProposalsReceived: opts.Metrics.NormalProposalsReceived.With("channel", support.ChannelID()),
+			ConfigProposalsReceived: opts.Metrics.ConfigProposalsReceived.With("channel", support.ChannelID()),
 		},
-		logger: lg,
-		opts:   opts,
+		logger:         lg,
+		opts:           opts,
+		CryptoProvider: cryptoProvider,
 	}
 
 	// Sets initial values for metrics
 	c.Metrics.ClusterSize.Set(float64(len(c.opts.BlockMetadata.ConsenterIds)))
 	c.Metrics.IsLeader.Set(float64(0)) // all nodes start out as followers
+	c.Metrics.ActiveNodes.Set(float64(0))
 	c.Metrics.CommittedBlockNumber.Set(float64(c.lastBlock.Header.Number))
 	c.Metrics.SnapshotBlockNumber.Set(float64(c.lastSnapBlockNum))
 
@@ -295,17 +309,28 @@ func NewChain(
 		DisableProposalForwarding: true, // This prevents blocks from being accidentally proposed by followers
 	}
 
+	disseminator := &Disseminator{RPC: c.rpc}
+	disseminator.UpdateMetadata(nil) // initialize
+	c.ActiveNodes.Store([]uint64{})
+
 	c.Node = &node{
 		chainID:      c.channelID,
 		chain:        c,
 		logger:       c.logger,
 		metrics:      c.Metrics,
 		storage:      storage,
-		rpc:          c.rpc,
+		rpc:          disseminator,
 		config:       config,
 		tickInterval: c.opts.TickInterval,
 		clock:        c.clock,
 		metadata:     c.opts.BlockMetadata,
+		tracker: &Tracker{
+			id:     c.raftID,
+			sender: disseminator,
+			gauge:  c.Metrics.ActiveNodes,
+			active: &c.ActiveNodes,
+			logger: c.logger,
+		},
 	}
 
 	return c, nil
@@ -344,6 +369,7 @@ func (c *Chain) Start() {
 	c.periodicChecker = &PeriodicCheck{
 		Logger:        c.logger,
 		Report:        es.confirmSuspicion,
+		ReportCleared: es.clearSuspicion,
 		CheckInterval: interval,
 		Condition:     c.suspectEviction,
 	}
@@ -402,6 +428,10 @@ func (c *Chain) Halt() {
 		return
 	}
 	<-c.doneC
+
+	if c.haltCallback != nil {
+		c.haltCallback()
+	}
 }
 
 func (c *Chain) isRunning() error {
@@ -431,9 +461,27 @@ func (c *Chain) Consensus(req *orderer.ConsensusRequest, sender uint64) error {
 		return fmt.Errorf("failed to unmarshal StepRequest payload to Raft Message: %s", err)
 	}
 
+	if stepMsg.To != c.raftID {
+		c.logger.Warnf("Received msg to %d, my ID is probably wrong due to out of date, cowardly halting", stepMsg.To)
+		c.Halt()
+		return nil
+	}
+
 	if err := c.Node.Step(context.TODO(), *stepMsg); err != nil {
 		return fmt.Errorf("failed to process Raft Step message: %s", err)
 	}
+
+	if len(req.Metadata) == 0 || atomic.LoadUint64(&c.lastKnownLeader) != sender { // ignore metadata from non-leader
+		return nil
+	}
+
+	clusterMetadata := &etcdraft.ClusterMetadata{}
+	if err := proto.Unmarshal(req.Metadata, clusterMetadata); err != nil {
+		return errors.Errorf("failed to unmarshal ClusterMetadata: %s", err)
+	}
+
+	c.Metrics.ActiveNodes.Set(float64(len(clusterMetadata.ActiveNodes)))
+	c.ActiveNodes.Store(clusterMetadata.ActiveNodes)
 
 	return nil
 }
@@ -723,6 +771,7 @@ func (c *Chain) run() {
 			}
 
 		case <-c.doneC:
+			stopTimer()
 			cancelProp()
 
 			select {
@@ -825,8 +874,6 @@ func (c *Chain) propose(ch chan<- *common.Block, bc *blockCreator, batches ...[]
 
 		c.blockInflight++
 	}
-
-	return
 }
 
 func (c *Chain) catchUp(snap *raftpb.Snapshot) error {
@@ -901,7 +948,7 @@ func (c *Chain) detectConfChange(block *common.Block) *MembershipChanges {
 		c.sizeLimit = configMetadata.Options.SnapshotIntervalSize
 	}
 
-	changes, err := ComputeMembershipChanges(c.opts.BlockMetadata, c.opts.Consenters, configMetadata.Consenters)
+	changes, err := ComputeMembershipChanges(c.opts.BlockMetadata, c.opts.Consenters, configMetadata.Consenters, c.support.SharedConfig())
 	if err != nil {
 		c.logger.Panicf("illegal configuration change detected: %s", err)
 	}
@@ -1021,8 +1068,6 @@ func (c *Chain) apply(ents []raftpb.Entry) {
 			c.logger.Warnf("Snapshotting is in progress, it is very likely that SnapshotIntervalSize is too small")
 		}
 	}
-
-	return
 }
 
 func (c *Chain) gc() {
@@ -1071,11 +1116,11 @@ func (c *Chain) remotePeers() ([]cluster.RemoteNode, error) {
 		if raftID == c.raftID {
 			continue
 		}
-		serverCertAsDER, err := c.pemToDER(consenter.ServerTlsCert, raftID, "server")
+		serverCertAsDER, err := pemToDER(consenter.ServerTlsCert, raftID, "server", c.logger)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
-		clientCertAsDER, err := c.pemToDER(consenter.ClientTlsCert, raftID, "client")
+		clientCertAsDER, err := pemToDER(consenter.ClientTlsCert, raftID, "client", c.logger)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -1089,10 +1134,10 @@ func (c *Chain) remotePeers() ([]cluster.RemoteNode, error) {
 	return nodes, nil
 }
 
-func (c *Chain) pemToDER(pemBytes []byte, id uint64, certType string) ([]byte, error) {
+func pemToDER(pemBytes []byte, id uint64, certType string, logger *flogging.FabricLogger) ([]byte, error) {
 	bl, _ := pem.Decode(pemBytes)
 	if bl == nil {
-		c.logger.Errorf("Rejecting PEM block of %s TLS cert for node %d, offending PEM is: %s", certType, id, string(pemBytes))
+		logger.Errorf("Rejecting PEM block of %s TLS cert for node %d, offending PEM is: %s", certType, id, string(pemBytes))
 		return nil, errors.Errorf("invalid PEM block")
 	}
 	return bl.Bytes, nil
@@ -1226,6 +1271,66 @@ func (c *Chain) newConfigMetadata(block *common.Block) *etcdraft.ConfigMetadata 
 	return metadata
 }
 
+// ValidateConsensusMetadata determines the validity of a
+// ConsensusMetadata update during config updates on the channel.
+func (c *Chain) ValidateConsensusMetadata(oldMetadataBytes, newMetadataBytes []byte, newChannel bool) error {
+	// metadata was not updated
+	if newMetadataBytes == nil {
+		return nil
+	}
+	if oldMetadataBytes == nil {
+		c.logger.Panic("Programming Error: ValidateConsensusMetadata called with nil old metadata")
+	}
+
+	oldMetadata := &etcdraft.ConfigMetadata{}
+	if err := proto.Unmarshal(oldMetadataBytes, oldMetadata); err != nil {
+		c.logger.Panicf("Programming Error: Failed to unmarshal old etcdraft consensus metadata: %v", err)
+	}
+	newMetadata := &etcdraft.ConfigMetadata{}
+	if err := proto.Unmarshal(newMetadataBytes, newMetadata); err != nil {
+		return errors.Wrap(err, "failed to unmarshal new etcdraft metadata configuration")
+	}
+
+	err := CheckConfigMetadata(newMetadata)
+	if err != nil {
+		return errors.Wrap(err, "invalid new config metdadata")
+	}
+
+	if newChannel {
+		// check if the consenters are a subset of the existing consenters (system channel consenters)
+		set := ConsentersToMap(oldMetadata.Consenters)
+		for _, c := range newMetadata.Consenters {
+			if _, exits := set[string(c.ClientTlsCert)]; !exits {
+				return errors.New("new channel has consenter that is not part of system consenter set")
+			}
+		}
+		return nil
+	}
+
+	// create the dummy parameters for ComputeMembershipChanges
+	c.raftMetadataLock.RLock()
+	dummyOldBlockMetadata := proto.Clone(c.opts.BlockMetadata).(*etcdraft.BlockMetadata)
+	c.raftMetadataLock.RUnlock()
+
+	dummyOldConsentersMap := CreateConsentersMap(dummyOldBlockMetadata, oldMetadata)
+	changes, err := ComputeMembershipChanges(dummyOldBlockMetadata, dummyOldConsentersMap, newMetadata.Consenters, c.support.SharedConfig())
+	if err != nil {
+		return err
+	}
+
+	active := c.ActiveNodes.Load().([]uint64)
+	if changes.UnacceptableQuorumLoss(active) {
+		return errors.Errorf("%d out of %d nodes are alive, configuration will result in quorum loss", len(active), len(dummyOldConsentersMap))
+	}
+
+	return nil
+}
+
+// StatusReport returns the ClusterRelation & Status
+func (c *Chain) StatusReport() (types.ClusterRelation, types.Status) {
+	return types.ClusterRelationMember, types.StatusActive
+}
+
 func (c *Chain) suspectEviction() bool {
 	if c.isRunning() != nil {
 		return false
@@ -1235,8 +1340,13 @@ func (c *Chain) suspectEviction() bool {
 }
 
 func (c *Chain) newEvictionSuspector() *evictionSuspector {
+	consenterCertificate := &ConsenterCertificate{
+		ConsenterCertificate: c.opts.Cert,
+		CryptoProvider:       c.CryptoProvider,
+	}
+
 	return &evictionSuspector{
-		amIInChannel:               ConsenterCertificate(c.opts.Cert).IsConsenterOfChannel,
+		amIInChannel:               consenterCertificate.IsConsenterOfChannel,
 		evictionSuspicionThreshold: c.opts.EvictionSuspicion,
 		writeBlock:                 c.support.Append,
 		createPuller:               c.createPuller,

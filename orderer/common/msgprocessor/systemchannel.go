@@ -10,13 +10,14 @@ import (
 	"fmt"
 
 	"github.com/golang/protobuf/proto"
+	cb "github.com/hyperledger/fabric-protos-go/common"
+	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/configtx"
 	"github.com/hyperledger/fabric/common/policies"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
-	cb "github.com/hyperledger/fabric/protos/common"
+	"github.com/hyperledger/fabric/orderer/common/localconfig"
 	"github.com/hyperledger/fabric/protoutil"
-
 	"github.com/pkg/errors"
 )
 
@@ -38,10 +39,10 @@ type SystemChannel struct {
 }
 
 // NewSystemChannel creates a new system channel message processor.
-func NewSystemChannel(support StandardChannelSupport, templator ChannelConfigTemplator, filters *RuleSet) *SystemChannel {
-	logger.Debugf("Creating system channel msg processor for channel %s", support.ChainID())
+func NewSystemChannel(support StandardChannelSupport, templator ChannelConfigTemplator, filters *RuleSet, bccsp bccsp.BCCSP) *SystemChannel {
+	logger.Debugf("Creating system channel msg processor for channel %s", support.ChannelID())
 	return &SystemChannel{
-		StandardChannel: NewStandardChannel(support, filters),
+		StandardChannel: NewStandardChannel(support, filters, bccsp),
 		templator:       templator,
 	}
 }
@@ -51,17 +52,23 @@ func NewSystemChannel(support StandardChannelSupport, templator ChannelConfigTem
 // In maintenance mode, require the signature of /Channel/Orderer/Writers. This will filter out configuration
 // changes that are not related to consensus-type migration (e.g on /Channel/Application).
 func CreateSystemChannelFilters(
+	config localconfig.TopLevel,
 	chainCreator ChainCreator,
 	ledgerResources channelconfig.Resources,
 	validator MetadataValidator,
 ) *RuleSet {
-	return NewRuleSet([]Rule{
+	rules := []Rule{
 		EmptyRejectRule,
-		NewExpirationRejectRule(ledgerResources),
 		NewSizeFilter(ledgerResources),
 		NewSigFilter(policies.ChannelWriters, policies.ChannelOrdererWriters, ledgerResources),
 		NewSystemChannelFilter(ledgerResources, chainCreator, validator),
-	})
+	}
+	if !config.General.Authentication.NoExpirationChecks {
+		expirationRule := NewExpirationRejectRule(ledgerResources)
+		// In case of DoS, expiration is inserted before SigFilter, so it is evaluated first
+		rules = append(rules[:2], append([]Rule{expirationRule}, rules[2:]...)...)
+	}
+	return NewRuleSet(rules)
 }
 
 // ProcessNormalMsg handles normal messages, rejecting them if they are not bound for the system channel ID
@@ -76,7 +83,7 @@ func (s *SystemChannel) ProcessNormalMsg(msg *cb.Envelope) (configSeq uint64, er
 	// because the message processor is looked up by channel ID.
 	// However, the system channel message processor is the catch all for messages
 	// which do not correspond to an extant channel, so we must check it here.
-	if channelID != s.support.ChainID() {
+	if channelID != s.support.ChannelID() {
 		return 0, ErrChannelDoesNotExist
 	}
 
@@ -94,13 +101,13 @@ func (s *SystemChannel) ProcessConfigUpdateMsg(envConfigUpdate *cb.Envelope) (co
 
 	logger.Debugf("Processing config update tx with system channel message processor for channel ID %s", channelID)
 
-	if channelID == s.support.ChainID() {
+	if channelID == s.support.ChannelID() {
 		return s.StandardChannel.ProcessConfigUpdateMsg(envConfigUpdate)
 	}
 
 	// XXX we should check that the signature on the outer envelope is at least valid for some MSP in the system channel
 
-	logger.Debugf("Processing channel create tx for channel %s on system channel %s", channelID, s.support.ChainID())
+	logger.Debugf("Processing channel create tx for channel %s on system channel %s", channelID, s.support.ChannelID())
 
 	// If the channel ID does not match the system channel, then this must be a channel creation transaction
 
@@ -119,7 +126,7 @@ func (s *SystemChannel) ProcessConfigUpdateMsg(envConfigUpdate *cb.Envelope) (co
 		return nil, 0, err
 	}
 
-	wrappedOrdererTransaction, err := protoutil.CreateSignedEnvelope(cb.HeaderType_ORDERER_TRANSACTION, s.support.ChainID(), s.support.Signer(), newChannelEnvConfig, msgVersion, epoch)
+	wrappedOrdererTransaction, err := protoutil.CreateSignedEnvelope(cb.HeaderType_ORDERER_TRANSACTION, s.support.ChannelID(), s.support.Signer(), newChannelEnvConfig, msgVersion, epoch)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -207,12 +214,14 @@ type DefaultTemplatorSupport interface {
 // DefaultTemplator implements the ChannelConfigTemplator interface and is the one used in production deployments.
 type DefaultTemplator struct {
 	support DefaultTemplatorSupport
+	bccsp   bccsp.BCCSP
 }
 
 // NewDefaultTemplator returns an instance of the DefaultTemplator.
-func NewDefaultTemplator(support DefaultTemplatorSupport) *DefaultTemplator {
+func NewDefaultTemplator(support DefaultTemplatorSupport, bccsp bccsp.BCCSP) *DefaultTemplator {
 	return &DefaultTemplator{
 		support: support,
+		bccsp:   bccsp,
 	}
 }
 
@@ -324,7 +333,7 @@ func (dt *DefaultTemplator) NewChannelConfig(envConfigUpdate *cb.Envelope) (chan
 		for orgName := range configUpdate.WriteSet.Groups[channelconfig.ApplicationGroupKey].Groups {
 			consortiumGroup, ok := systemChannelGroup.Groups[channelconfig.ConsortiumsGroupKey].Groups[consortium.Name].Groups[orgName]
 			if !ok {
-				return nil, fmt.Errorf("Attempted to include a member which is not in the consortium")
+				return nil, fmt.Errorf("Attempted to include member %s which is not in the consortium", orgName)
 			}
 			applicationGroup.Groups[orgName] = proto.Clone(consortiumGroup).(*cb.ConfigGroup)
 		}
@@ -362,7 +371,7 @@ func (dt *DefaultTemplator) NewChannelConfig(envConfigUpdate *cb.Envelope) (chan
 
 	bundle, err := channelconfig.NewBundle(channelHeader.ChannelId, &cb.Config{
 		ChannelGroup: channelGroup,
-	})
+	}, dt.bccsp)
 
 	if err != nil {
 		return nil, err

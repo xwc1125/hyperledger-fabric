@@ -9,8 +9,8 @@ package main
 import (
 	"testing"
 
-	"github.com/hyperledger/fabric/protos/peer"
-	"github.com/stretchr/testify/assert"
+	"github.com/hyperledger/fabric-protos-go/peer"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDecorator(t *testing.T) {
@@ -19,5 +19,5 @@ func TestDecorator(t *testing.T) {
 		Args: [][]byte{{1, 2, 3}},
 	}
 	out := dec.Decorate(nil, in)
-	assert.Equal(t, in, out)
+	require.Equal(t, in, out)
 }

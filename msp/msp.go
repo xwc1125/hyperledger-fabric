@@ -9,7 +9,7 @@ package msp
 import (
 	"time"
 
-	"github.com/hyperledger/fabric/protos/msp"
+	"github.com/hyperledger/fabric-protos-go/msp"
 )
 
 // IdentityDeserializer is implemented by both MSPManger and MSP
@@ -212,7 +212,7 @@ var mspTypeStrings = map[ProviderType]string{
 }
 
 var Options = map[string]NewOpts{
-	ProviderTypeToString(FABRIC): &BCCSPNewOpts{NewBaseOpts: NewBaseOpts{Version: MSPv1_0}},
+	ProviderTypeToString(FABRIC): &BCCSPNewOpts{NewBaseOpts: NewBaseOpts{Version: MSPv1_4_3}},
 	ProviderTypeToString(IDEMIX): &IdemixNewOpts{NewBaseOpts: NewBaseOpts{Version: MSPv1_1}},
 }
 

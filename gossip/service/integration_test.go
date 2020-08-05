@@ -12,42 +12,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hyperledger/fabric/core/comm"
+	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/core/deliverservice"
-	"github.com/hyperledger/fabric/core/deliverservice/blocksprovider"
-	"github.com/hyperledger/fabric/core/ledger"
-	"github.com/hyperledger/fabric/core/transientstore"
 	"github.com/hyperledger/fabric/gossip/api"
 	"github.com/hyperledger/fabric/gossip/election"
 	"github.com/hyperledger/fabric/gossip/util"
-	"github.com/hyperledger/fabric/protos/ledger/rwset"
-	transientstore2 "github.com/hyperledger/fabric/protos/transientstore"
-	"github.com/spf13/viper"
-	"github.com/stretchr/testify/assert"
+	"github.com/hyperledger/fabric/internal/pkg/comm"
+	"github.com/hyperledger/fabric/internal/pkg/peer/blocksprovider"
+	"github.com/hyperledger/fabric/internal/pkg/peer/orderers"
+	"github.com/stretchr/testify/require"
 )
-
-type transientStoreMock struct {
-}
-
-func (*transientStoreMock) PurgeByHeight(maxBlockNumToRetain uint64) error {
-	return nil
-}
-
-func (*transientStoreMock) Persist(txid string, blockHeight uint64, privateSimulationResults *rwset.TxPvtReadWriteSet) error {
-	panic("implement me")
-}
-
-func (*transientStoreMock) PersistWithConfig(txid string, blockHeight uint64, privateSimulationResultsWithConfig *transientstore2.TxPvtReadWriteSetWithConfigInfo) error {
-	panic("implement me")
-}
-
-func (*transientStoreMock) GetTxPvtRWSetByTxid(txid string, filter ledger.PvtNsCollFilter) (transientstore.RWSetScanner, error) {
-	panic("implement me")
-}
-
-func (*transientStoreMock) PurgeByTxids(txids []string) error {
-	panic("implement me")
-}
 
 type embeddingDeliveryService struct {
 	startOnce sync.Once
@@ -96,12 +70,9 @@ type embeddingDeliveryServiceFactory struct {
 	DeliveryServiceFactory
 }
 
-func (edsf *embeddingDeliveryServiceFactory) Service(g GossipServiceAdapter, endpoints []string, mcs api.MessageCryptoService) (deliverservice.DeliverService, error) {
-	ds, err := edsf.DeliveryServiceFactory.Service(g, endpoints, mcs)
-	if err != nil {
-		panic(err)
-	}
-	return newEmbeddingDeliveryService(ds), nil
+func (edsf *embeddingDeliveryServiceFactory) Service(g GossipServiceAdapter, endpoints *orderers.ConnectionSource, mcs api.MessageCryptoService, isStaticLeader bool) deliverservice.DeliverService {
+	ds := edsf.DeliveryServiceFactory.Service(g, endpoints, mcs, false)
+	return newEmbeddingDeliveryService(ds)
 }
 
 func TestLeaderYield(t *testing.T) {
@@ -111,10 +82,8 @@ func TestLeaderYield(t *testing.T) {
 	// Make sure the other peer declares itself as the leader soon after.
 	takeOverMaxTimeout := time.Minute
 	// It's enough to make single re-try
-	viper.Set("peer.deliveryclient.reconnectTotalTimeThreshold", time.Second*1)
 	// There is no ordering service available anyway, hence connection timeout
 	// could be shorter
-	viper.Set("peer.deliveryclient.connTimeout", time.Millisecond*100)
 	serviceConfig := &ServiceConfig{
 		UseLeaderElection:          true,
 		OrgLeader:                  false,
@@ -128,27 +97,36 @@ func TestLeaderYield(t *testing.T) {
 		ElectionLeaderElectionDuration: time.Millisecond * 500,
 	}
 	n := 2
-	gossips := startPeers(t, serviceConfig, n, 0, 1)
+	gossips := startPeers(serviceConfig, n, 0, 1)
 	defer stopPeers(gossips)
 	channelName := "channelA"
 	peerIndexes := []int{0, 1}
 	// Add peers to the channel
-	addPeersToChannel(t, n, channelName, gossips, peerIndexes)
+	addPeersToChannel(channelName, gossips, peerIndexes)
 	// Prime the membership view of the peers
 	waitForFullMembershipOrFailNow(t, channelName, gossips, n, time.Second*30, time.Millisecond*100)
 
-	endpoint, socket := getAvailablePort(t)
-	socket.Close()
+	grpcClient, err := comm.NewGRPCClient(comm.ClientConfig{})
+	require.NoError(t, err)
+
+	store := newTransientStore(t)
+	defer store.tearDown()
 
 	// Helper function that creates a gossipService instance
 	newGossipService := func(i int) *GossipService {
 		gs := gossips[i].GossipService
 		gs.deliveryFactory = &embeddingDeliveryServiceFactory{&deliveryFactoryImpl{
 			credentialSupport: comm.NewCredentialSupport(),
+			deliverServiceConfig: &deliverservice.DeliverServiceConfig{
+				PeerTLSEnabled:              false,
+				ReConnectBackoffThreshold:   deliverservice.DefaultReConnectBackoffThreshold,
+				ReconnectTotalTimeThreshold: time.Second,
+				ConnectionTimeout:           time.Millisecond * 100,
+			},
+			deliverGRPCClient: grpcClient,
 		}}
-		gs.InitializeChannel(channelName, []string{endpoint}, Support{
+		gs.InitializeChannel(channelName, orderers.NewConnectionSource(flogging.MustGetLogger("peer.orderers"), nil), store.Store, Support{
 			Committer: &mockLedgerInfo{1},
-			Store:     &transientStoreMock{},
 		})
 		return gs
 	}
@@ -190,12 +168,12 @@ func TestLeaderYield(t *testing.T) {
 	ds0.waitForDeliveryServiceActivation()
 	t.Log("p0 started its delivery service")
 	// Ensure it's a leader
-	assert.Equal(t, 0, getLeader())
+	require.Equal(t, 0, getLeader())
 	// Wait for p0 to lose its leadership
 	ds0.waitForDeliveryServiceTermination()
 	t.Log("p0 stopped its delivery service")
 	// Ensure p0 is not a leader
-	assert.NotEqual(t, 0, getLeader())
+	require.NotEqual(t, 0, getLeader())
 	// Wait for p1 to take over. It should take over before time reaches timeLimit
 	timeLimit := time.Now().Add(takeOverMaxTimeout)
 	for getLeader() != 1 && time.Now().Before(timeLimit) {

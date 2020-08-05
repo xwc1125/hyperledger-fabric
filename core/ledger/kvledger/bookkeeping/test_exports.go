@@ -20,22 +20,23 @@ import (
 	"io/ioutil"
 	"os"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestEnv provides the bookkeeper provider env for testing
 type TestEnv struct {
 	t            testing.TB
-	TestProvider Provider
+	TestProvider *Provider
 	dbPath       string
 }
 
 // NewTestEnv construct a TestEnv for testing
 func NewTestEnv(t testing.TB) *TestEnv {
 	dbPath, err := ioutil.TempDir("", "bookkeep")
-	if err != nil {
-		t.Fatalf("Failed to create bookkeeping directory: %s", err)
-	}
-	provider := NewProvider(dbPath)
+	require.NoError(t, err)
+	provider, err := NewProvider(dbPath)
+	require.NoError(t, err)
 	return &TestEnv{t, provider, dbPath}
 }
 

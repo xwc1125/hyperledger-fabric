@@ -8,8 +8,8 @@ package blockledger
 
 import (
 	"github.com/golang/protobuf/proto"
-	cb "github.com/hyperledger/fabric/protos/common"
-	ab "github.com/hyperledger/fabric/protos/orderer"
+	cb "github.com/hyperledger/fabric-protos-go/common"
+	ab "github.com/hyperledger/fabric-protos-go/orderer"
 	"github.com/hyperledger/fabric/protoutil"
 )
 
@@ -44,6 +44,7 @@ func (nfei *NotFoundErrorIterator) Close() {}
 func CreateNextBlock(rl Reader, messages []*cb.Envelope) *cb.Block {
 	var nextBlockNumber uint64
 	var previousBlockHash []byte
+	var err error
 
 	if rl.Height() > 0 {
 		it, _ := rl.Iterator(&ab.SeekPosition{
@@ -63,7 +64,6 @@ func CreateNextBlock(rl Reader, messages []*cb.Envelope) *cb.Block {
 		Data: make([][]byte, len(messages)),
 	}
 
-	var err error
 	for i, msg := range messages {
 		data.Data[i], err = proto.Marshal(msg)
 		if err != nil {

@@ -15,11 +15,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hyperledger/fabric-protos-go/common"
+	"github.com/hyperledger/fabric-protos-go/orderer"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
-	"github.com/hyperledger/fabric/protos/common"
-	"github.com/hyperledger/fabric/protos/orderer"
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
@@ -281,7 +281,8 @@ func (p *BlockPuller) probeEndpoints(minRequestedSequence uint64) *endpointInfoB
 			defer wg.Done()
 			ei, err := p.probeEndpoint(endpoint, minRequestedSequence)
 			if err != nil {
-				p.Logger.Warningf("Received error of type '%v' from %s", err, endpoint)
+				p.Logger.Warningf("Received error of type '%v' from %s", err, endpoint.Endpoint)
+				p.Logger.Debugf("%s's TLSRootCAs are %s", endpoint.Endpoint, endpoint.TLSRootCAs)
 				if err == ErrForbidden {
 					atomic.StoreUint32(&forbiddenErr, 1)
 				}

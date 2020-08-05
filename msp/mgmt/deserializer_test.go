@@ -11,58 +11,67 @@ import (
 	"os"
 	"testing"
 
+	"github.com/hyperledger/fabric/bccsp/factory"
+	"github.com/hyperledger/fabric/bccsp/sw"
 	"github.com/hyperledger/fabric/core/config/configtest"
 	"github.com/hyperledger/fabric/msp"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewDeserializersManager(t *testing.T) {
-	assert.NotNil(t, NewDeserializersManager())
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+	require.NotNil(t, NewDeserializersManager(cryptoProvider))
 }
 
 func TestMspDeserializersManager_Deserialize(t *testing.T) {
-	m := NewDeserializersManager()
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
 
-	i, err := GetLocalMSP().GetDefaultSigningIdentity()
-	assert.NoError(t, err)
+	m := NewDeserializersManager(cryptoProvider)
+
+	i, err := GetLocalMSP(cryptoProvider).GetDefaultSigningIdentity()
+	require.NoError(t, err)
 	raw, err := i.Serialize()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	i2, err := m.Deserialize(raw)
-	assert.NoError(t, err)
-	assert.NotNil(t, i2)
-	assert.NotNil(t, i2.IdBytes)
-	assert.Equal(t, m.GetLocalMSPIdentifier(), i2.Mspid)
+	require.NoError(t, err)
+	require.NotNil(t, i2)
+	require.NotNil(t, i2.IdBytes)
+	require.Equal(t, m.GetLocalMSPIdentifier(), i2.Mspid)
 }
 
 func TestMspDeserializersManager_GetChannelDeserializers(t *testing.T) {
-	m := NewDeserializersManager()
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+
+	m := NewDeserializersManager(cryptoProvider)
 
 	deserializers := m.GetChannelDeserializers()
-	assert.NotNil(t, deserializers)
+	require.NotNil(t, deserializers)
 }
 
 func TestMspDeserializersManager_GetLocalDeserializer(t *testing.T) {
-	m := NewDeserializersManager()
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
 
-	i, err := GetLocalMSP().GetDefaultSigningIdentity()
-	assert.NoError(t, err)
+	m := NewDeserializersManager(cryptoProvider)
+
+	i, err := GetLocalMSP(cryptoProvider).GetDefaultSigningIdentity()
+	require.NoError(t, err)
 	raw, err := i.Serialize()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	i2, err := m.GetLocalDeserializer().DeserializeIdentity(raw)
-	assert.NoError(t, err)
-	assert.NotNil(t, i2)
-	assert.Equal(t, m.GetLocalMSPIdentifier(), i2.GetMSPIdentifier())
+	require.NoError(t, err)
+	require.NotNil(t, i2)
+	require.Equal(t, m.GetLocalMSPIdentifier(), i2.GetMSPIdentifier())
 }
 
 func TestMain(m *testing.M) {
 
-	mspDir, err := configtest.GetDevMspDir()
-	if err != nil {
-		fmt.Printf("Error getting DevMspDir: %s", err)
-		os.Exit(-1)
-	}
+	mspDir := configtest.GetDevMspDir()
 
 	testConf, err := msp.GetLocalMspConfig(mspDir, nil, "SampleOrg")
 	if err != nil {
@@ -70,7 +79,9 @@ func TestMain(m *testing.M) {
 		os.Exit(-1)
 	}
 
-	err = GetLocalMSP().Setup(testConf)
+	cryptoProvider := factory.GetDefault()
+
+	err = GetLocalMSP(cryptoProvider).Setup(testConf)
 	if err != nil {
 		fmt.Printf("Setup for msp should have succeeded, got err %s instead", err)
 		os.Exit(-1)

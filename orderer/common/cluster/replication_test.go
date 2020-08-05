@@ -14,20 +14,21 @@ import (
 	"time"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric-protos-go/common"
+	"github.com/hyperledger/fabric-protos-go/msp"
+	"github.com/hyperledger/fabric-protos-go/orderer"
+	"github.com/hyperledger/fabric/bccsp/sw"
 	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/configtx"
 	"github.com/hyperledger/fabric/common/flogging"
-	"github.com/hyperledger/fabric/core/comm"
+	"github.com/hyperledger/fabric/internal/pkg/comm"
 	"github.com/hyperledger/fabric/orderer/common/cluster"
 	"github.com/hyperledger/fabric/orderer/common/cluster/mocks"
 	"github.com/hyperledger/fabric/orderer/common/localconfig"
-	"github.com/hyperledger/fabric/protos/common"
-	"github.com/hyperledger/fabric/protos/msp"
-	"github.com/hyperledger/fabric/protos/orderer"
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -81,10 +82,10 @@ func TestIsReplicationNeeded(t *testing.T) {
 
 			ok, err := r.IsReplicationNeeded()
 			if testCase.expectedError != "" {
-				assert.EqualError(t, err, testCase.expectedError)
+				require.EqualError(t, err, testCase.expectedError)
 			} else {
-				assert.NoError(t, err)
-				assert.Equal(t, testCase.replicationNeeded, ok)
+				require.NoError(t, err)
+				require.Equal(t, testCase.replicationNeeded, ok)
 			}
 		})
 	}
@@ -173,31 +174,6 @@ func TestReplicateChainsFailures(t *testing.T) {
 			ledgerFactoryError: errors.New("IO error"),
 			expectedPanic:      "Failed to create a ledger for channel channelWeAreNotPartOf: IO error",
 		},
-		{
-			name:                    "pulled genesis block is malformed",
-			latestBlockSeqInOrderer: 21,
-			channelsReturns: []cluster.ChannelGenesisBlock{
-				{ChannelName: "channelWeAreNotPartOf", GenesisBlock: &common.Block{Header: &common.BlockHeader{}}},
-			},
-			expectedPanic: "Failed converting channel creation block for channel channelWeAreNotPartOf to genesis" +
-				" block: block data is nil",
-		},
-		{
-			name:                    "pulled genesis block is malformed - bad payload",
-			latestBlockSeqInOrderer: 21,
-			channelsReturns: []cluster.ChannelGenesisBlock{
-				{ChannelName: "channelWeAreNotPartOf", GenesisBlock: &common.Block{
-					Header: &common.BlockHeader{},
-					Data: &common.BlockData{
-						Data: [][]byte{protoutil.MarshalOrPanic(&common.Envelope{
-							Payload: []byte{1, 2, 3},
-						})},
-					},
-				}},
-			},
-			expectedPanic: "Failed converting channel creation block for channel channelWeAreNotPartOf" +
-				" to genesis block: no payload in envelope: proto: common.Payload: illegal tag 0 (wire type 1)",
-		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			systemChannelBlocks := createBlockChain(0, 21)
@@ -269,7 +245,7 @@ func TestReplicateChainsFailures(t *testing.T) {
 				osn.blockResponses <- nil
 			}
 
-			assert.PanicsWithValue(t, testCase.expectedPanic, func() { r.ReplicateChains() })
+			require.PanicsWithValue(t, testCase.expectedPanic, func() { r.ReplicateChains() })
 			bp.Close()
 			dialer.assertAllConnectionsClosed(t)
 		})
@@ -342,7 +318,7 @@ func TestPullChannelFailure(t *testing.T) {
 			enqueueBlock(testcase.thirdBlockSequence)
 
 			err := r.PullChannel("mychannel")
-			assert.Equal(t, cluster.ErrRetryCountExhausted, err)
+			require.Equal(t, cluster.ErrRetryCountExhausted, err)
 		})
 	}
 
@@ -369,7 +345,7 @@ func TestPullerConfigFromTopLevelConfig(t *testing.T) {
 	}
 
 	config := cluster.PullerConfigFromTopLevelConfig("system", topLevelConfig, []byte{1, 2, 3}, []byte{3, 2, 1}, signer)
-	assert.Equal(t, expected, config)
+	require.Equal(t, expected, config)
 }
 
 func TestReplicateChainsChannelClassificationFailure(t *testing.T) {
@@ -426,7 +402,7 @@ func TestReplicateChainsChannelClassificationFailure(t *testing.T) {
 		Puller:        bp,
 	}
 
-	assert.PanicsWithValue(t, "Failed classifying whether I belong to channel A: oops, skipping chain retrieval", func() {
+	require.PanicsWithValue(t, "Failed classifying whether I belong to channel A: oops, skipping chain retrieval", func() {
 		r.ReplicateChains()
 	})
 
@@ -567,8 +543,8 @@ func TestReplicateChainsGreenPath(t *testing.T) {
 	// Unfortunately, it's not available!
 	osn.seekAssertions <- func(info *orderer.SeekInfo, actualChannel string) {
 		// Ensure the seek came to the right channel
-		assert.NotNil(osn.t, info.GetStart().GetNewest())
-		assert.Equal(t, "E", actualChannel)
+		require.NotNil(osn.t, info.GetStart().GetNewest())
+		require.Equal(t, "E", actualChannel)
 	}
 	// Send an EOF down the stream.
 	osn.blockResponses <- nil
@@ -577,8 +553,8 @@ func TestReplicateChainsGreenPath(t *testing.T) {
 	// which is followed by a response of service unavailable
 	osn.seekAssertions <- func(info *orderer.SeekInfo, actualChannel string) {
 		// Ensure the seek came to the right channel
-		assert.NotNil(osn.t, info.GetStart().GetNewest())
-		assert.Equal(t, "D", actualChannel)
+		require.NotNil(osn.t, info.GetStart().GetNewest())
+		require.Equal(t, "D", actualChannel)
 	}
 	osn.blockResponses <- &orderer.DeliverResponse{
 		Type: &orderer.DeliverResponse_Status{
@@ -590,8 +566,8 @@ func TestReplicateChainsGreenPath(t *testing.T) {
 	// which is followed by a response of forbidden
 	osn.seekAssertions <- func(info *orderer.SeekInfo, actualChannel string) {
 		// Ensure the seek came to the right channel
-		assert.NotNil(osn.t, info.GetStart().GetNewest())
-		assert.Equal(t, "C", actualChannel)
+		require.NotNil(osn.t, info.GetStart().GetNewest())
+		require.Equal(t, "C", actualChannel)
 	}
 
 	osn.blockResponses <- &orderer.DeliverResponse{
@@ -609,8 +585,8 @@ func TestReplicateChainsGreenPath(t *testing.T) {
 		// Orderer is expecting a poll for last block of the current channel
 		osn.seekAssertions <- func(info *orderer.SeekInfo, actualChannel string) {
 			// Ensure the seek came to the right channel
-			assert.NotNil(osn.t, info.GetStart().GetNewest())
-			assert.Equal(t, channel, actualChannel)
+			require.NotNil(osn.t, info.GetStart().GetNewest())
+			require.Equal(t, channel, actualChannel)
 		}
 
 		// Orderer returns its last block is 30.
@@ -644,8 +620,8 @@ func TestReplicateChainsGreenPath(t *testing.T) {
 	// We expect a probe for channel A only, because channel B isn't in the channel
 	osn.seekAssertions <- func(info *orderer.SeekInfo, actualChannel string) {
 		// Ensure the seek came to the right channel
-		assert.NotNil(osn.t, info.GetStart().GetNewest())
-		assert.Equal(t, "A", actualChannel)
+		require.NotNil(osn.t, info.GetStart().GetNewest())
+		require.Equal(t, "A", actualChannel)
 	}
 	osn.enqueueResponse(30)
 	// From this point onwards, we pull the blocks for the chain.
@@ -666,8 +642,8 @@ func TestReplicateChainsGreenPath(t *testing.T) {
 	// Pull assertions for the system channel
 	osn.seekAssertions <- func(info *orderer.SeekInfo, actualChannel string) {
 		// Ensure the seek came to the system channel.
-		assert.NotNil(osn.t, info.GetStart().GetNewest())
-		assert.Equal(t, "system", actualChannel)
+		require.NotNil(osn.t, info.GetStart().GetNewest())
+		require.Equal(t, "system", actualChannel)
 	}
 	osn.blockResponses <- &orderer.DeliverResponse{
 		Type: &orderer.DeliverResponse_Block{Block: systemChannelBlocks[21]},
@@ -691,23 +667,23 @@ func TestReplicateChainsGreenPath(t *testing.T) {
 	// to be committed (for channel A and the system channel) were committed.
 	close(blocksCommittedToLedgerA)
 	close(blocksCommittedToSystemLedger)
-	assert.Len(t, blocksCommittedToLedgerA, cap(blocksCommittedToLedgerA))
-	assert.Len(t, blocksCommittedToSystemLedger, cap(blocksCommittedToSystemLedger))
-	assert.Len(t, blocksCommittedToLedgerB, 1)
-	assert.Len(t, blocksCommittedToLedgerC, 1)
-	assert.Len(t, blocksCommittedToLedgerD, 1)
-	assert.Len(t, blocksCommittedToLedgerE, 1)
+	require.Len(t, blocksCommittedToLedgerA, cap(blocksCommittedToLedgerA))
+	require.Len(t, blocksCommittedToSystemLedger, cap(blocksCommittedToSystemLedger))
+	require.Len(t, blocksCommittedToLedgerB, 1)
+	require.Len(t, blocksCommittedToLedgerC, 1)
+	require.Len(t, blocksCommittedToLedgerD, 1)
+	require.Len(t, blocksCommittedToLedgerE, 1)
 	// Count the blocks for channel A
 	var expectedSequence uint64
 	for block := range blocksCommittedToLedgerA {
-		assert.Equal(t, expectedSequence, block.Header.Number)
+		require.Equal(t, expectedSequence, block.Header.Number)
 		expectedSequence++
 	}
 
 	// Count the blocks for the system channel
 	expectedSequence = uint64(0)
 	for block := range blocksCommittedToSystemLedger {
-		assert.Equal(t, expectedSequence, block.Header.Number)
+		require.Equal(t, expectedSequence, block.Header.Number)
 		expectedSequence++
 	}
 
@@ -748,7 +724,7 @@ func TestParticipant(t *testing.T) {
 			},
 			latestBlockSeq: uint64(99),
 			latestBlock:    &common.Block{},
-			expectedError:  "no metadata in block",
+			expectedError:  "failed to retrieve metadata: no metadata in block",
 		},
 		{
 			name: "Pulled block has no last config sequence in metadata",
@@ -758,24 +734,38 @@ func TestParticipant(t *testing.T) {
 			latestBlockSeq: uint64(99),
 			latestBlock: &common.Block{
 				Metadata: &common.BlockMetadata{
-					Metadata: [][]byte{{1, 2, 3}},
+					Metadata: nil,
 				},
 			},
-			expectedError: "no metadata in block",
+			expectedError: "failed to retrieve metadata: no metadata at index [SIGNATURES]",
 		},
 		{
-			name: "Pulled block's metadata is malformed",
+			name: "Pulled block's SIGNATURES metadata is malformed",
 			heightsByEndpoints: map[string]uint64{
 				"orderer.example.com:7050": 100,
 			},
 			latestBlockSeq: uint64(99),
 			latestBlock: &common.Block{
 				Metadata: &common.BlockMetadata{
-					Metadata: [][]byte{{1, 2, 3}, {1, 2, 3}},
+					Metadata: [][]byte{{1, 2, 3}},
 				},
 			},
-			expectedError: "error unmarshaling metadata from" +
-				" block at index [LAST_CONFIG]: proto: common.Metadata: illegal tag 0 (wire type 1)",
+			expectedError: "failed to retrieve metadata: error unmarshaling metadata" +
+				" at index [SIGNATURES]: proto: common.Metadata: illegal tag 0 (wire type 1)",
+		},
+		{
+			name: "Pulled block's LAST_CONFIG metadata is malformed",
+			heightsByEndpoints: map[string]uint64{
+				"orderer.example.com:7050": 100,
+			},
+			latestBlockSeq: uint64(99),
+			latestBlock: &common.Block{
+				Metadata: &common.BlockMetadata{
+					Metadata: [][]byte{{}, {1, 2, 3}},
+				},
+			},
+			expectedError: "failed to retrieve metadata: error unmarshaling metadata" +
+				" at index [LAST_CONFIG]: proto: common.Metadata: illegal tag 0 (wire type 1)",
 		},
 		{
 			name: "Pulled block's metadata is valid and has a last config",
@@ -785,9 +775,9 @@ func TestParticipant(t *testing.T) {
 			latestBlockSeq: uint64(99),
 			latestBlock: &common.Block{
 				Metadata: &common.BlockMetadata{
-					Metadata: [][]byte{{1, 2, 3}, protoutil.MarshalOrPanic(&common.Metadata{
-						Value: protoutil.MarshalOrPanic(&common.LastConfig{
-							Index: 42,
+					Metadata: [][]byte{protoutil.MarshalOrPanic(&common.Metadata{
+						Value: protoutil.MarshalOrPanic(&common.OrdererBlockMetadata{
+							LastConfig: &common.LastConfig{Index: 42},
 						}),
 					})},
 				},
@@ -814,9 +804,9 @@ func TestParticipant(t *testing.T) {
 			latestBlockSeq: uint64(99),
 			latestBlock: &common.Block{
 				Metadata: &common.BlockMetadata{
-					Metadata: [][]byte{{1, 2, 3}, protoutil.MarshalOrPanic(&common.Metadata{
-						Value: protoutil.MarshalOrPanic(&common.LastConfig{
-							Index: 42,
+					Metadata: [][]byte{protoutil.MarshalOrPanic(&common.Metadata{
+						Value: protoutil.MarshalOrPanic(&common.OrdererBlockMetadata{
+							LastConfig: &common.LastConfig{Index: 42},
 						}),
 					})},
 				},
@@ -839,11 +829,11 @@ func TestParticipant(t *testing.T) {
 
 			err := cluster.Participant(puller, predicate)
 			if testCase.expectedError != "" {
-				assert.EqualError(t, err, testCase.expectedError)
-				assert.Len(t, configBlocks, 0)
+				require.EqualError(t, err, testCase.expectedError)
+				require.Len(t, configBlocks, 0)
 			} else {
-				assert.Len(t, configBlocks, 1)
-				assert.Equal(t, err, testCase.predicateReturns)
+				require.Len(t, configBlocks, 1)
+				require.Equal(t, testCase.predicateReturns, err)
 			}
 		})
 	}
@@ -851,10 +841,13 @@ func TestParticipant(t *testing.T) {
 
 func TestBlockPullerFromConfigBlockFailures(t *testing.T) {
 	blockBytes, err := ioutil.ReadFile("testdata/mychannel.block")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	validBlock := &common.Block{}
-	assert.NoError(t, proto.Unmarshal(blockBytes, validBlock))
+	require.NoError(t, proto.Unmarshal(blockBytes, validBlock))
+
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
 
 	for _, testCase := range []struct {
 		name         string
@@ -897,9 +890,9 @@ func TestBlockPullerFromConfigBlockFailures(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			verifierRetriever := &mocks.VerifierRetriever{}
 			verifierRetriever.On("RetrieveVerifier", mock.Anything).Return(&cluster.NoopBlockVerifier{})
-			bp, err := cluster.BlockPullerFromConfigBlock(testCase.pullerConfig, testCase.block, verifierRetriever)
-			assert.EqualError(t, err, testCase.expectedErr)
-			assert.Nil(t, bp)
+			bp, err := cluster.BlockPullerFromConfigBlock(testCase.pullerConfig, testCase.block, verifierRetriever, cryptoProvider)
+			require.EqualError(t, err, testCase.expectedErr)
+			require.Nil(t, bp)
 		})
 	}
 }
@@ -911,19 +904,19 @@ func testBlockPullerFromConfig(t *testing.T, blockVerifiers []cluster.BlockVerif
 	}
 
 	caCert, err := ioutil.ReadFile(filepath.Join("testdata", "ca.crt"))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	tlsCert, err := ioutil.ReadFile(filepath.Join("testdata", "server.crt"))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	tlsKey, err := ioutil.ReadFile(filepath.Join("testdata", "server.key"))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	osn := newClusterNode(t)
 	osn.srv.Stop()
 	// Replace the gRPC server with a TLS one
 	osn.srv, err = comm.NewGRPCServer("127.0.0.1:0", comm.ServerConfig{
-		SecOpts: &comm.SecureOptions{
+		SecOpts: comm.SecureOptions{
 			Key:               tlsKey,
 			RequireClientCert: true,
 			Certificate:       tlsCert,
@@ -931,7 +924,7 @@ func testBlockPullerFromConfig(t *testing.T, blockVerifiers []cluster.BlockVerif
 			UseTLS:            true,
 		},
 	})
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	orderer.RegisterAtomicBroadcastServer(osn.srv.Server(), osn)
 	// And start it
 	go osn.srv.Start()
@@ -939,10 +932,10 @@ func testBlockPullerFromConfig(t *testing.T, blockVerifiers []cluster.BlockVerif
 
 	// Start from a valid configuration block
 	blockBytes, err := ioutil.ReadFile(filepath.Join("testdata", "mychannel.block"))
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	validBlock := &common.Block{}
-	assert.NoError(t, proto.Unmarshal(blockBytes, validBlock))
+	require.NoError(t, proto.Unmarshal(blockBytes, validBlock))
 
 	// And inject into it a 127.0.0.1 orderer endpoint endpoint and a new TLS CA certificate.
 	injectTLSCACert(t, validBlock, caCert)
@@ -968,6 +961,9 @@ func testBlockPullerFromConfig(t *testing.T, blockVerifiers []cluster.BlockVerif
 		osn.addExpectPullAssert(0)
 	}
 
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+
 	bp, err := cluster.BlockPullerFromConfigBlock(cluster.PullerConfig{
 		TLSCert:             tlsCert,
 		TLSKey:              tlsKey,
@@ -975,9 +971,9 @@ func testBlockPullerFromConfig(t *testing.T, blockVerifiers []cluster.BlockVerif
 		Channel:             "mychannel",
 		Signer:              &mocks.SignerSerializer{},
 		Timeout:             time.Hour,
-	}, validBlock, verifierRetriever)
+	}, validBlock, verifierRetriever, cryptoProvider)
 	bp.RetryTimeout = time.Millisecond * 10
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	defer bp.Close()
 
 	var seenExpectedLogMsg bool
@@ -990,8 +986,8 @@ func testBlockPullerFromConfig(t *testing.T, blockVerifiers []cluster.BlockVerif
 	}))
 
 	block := bp.PullBlock(0)
-	assert.Equal(t, uint64(0), block.Header.Number)
-	assert.True(t, seenExpectedLogMsg)
+	require.Equal(t, uint64(0), block.Header.Number)
+	require.True(t, seenExpectedLogMsg)
 }
 
 func TestSkipPullingPulledChannels(t *testing.T) {
@@ -1042,8 +1038,8 @@ func TestSkipPullingPulledChannels(t *testing.T) {
 	enqueueBlock(5)
 
 	err := r.PullChannel("mychannel")
-	assert.NoError(t, err)
-	assert.True(t, detectedChannelPulled)
+	require.NoError(t, err)
+	require.True(t, detectedChannelPulled)
 }
 
 func TestBlockPullerFromConfigBlockGreenPath(t *testing.T) {
@@ -1077,20 +1073,23 @@ func TestBlockPullerFromConfigBlockGreenPath(t *testing.T) {
 
 func TestNoopBlockVerifier(t *testing.T) {
 	v := &cluster.NoopBlockVerifier{}
-	assert.Nil(t, v.VerifyBlockSignature(nil, nil))
+	require.Nil(t, v.VerifyBlockSignature(nil, nil))
 }
 
 func injectGlobalOrdererEndpoint(t *testing.T, block *common.Block, endpoint string) {
 	ordererAddresses := channelconfig.OrdererAddressesValue([]string{endpoint})
 	// Unwrap the layers until we reach the orderer addresses
 	env, err := protoutil.ExtractEnvelope(block, 0)
-	assert.NoError(t, err)
-	payload, err := protoutil.ExtractPayload(env)
-	assert.NoError(t, err)
+	require.NoError(t, err)
+	payload, err := protoutil.UnmarshalPayload(env.Payload)
+	require.NoError(t, err)
 	confEnv, err := configtx.UnmarshalConfigEnvelope(payload.Data)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	// Replace the orderer addresses
-	confEnv.Config.ChannelGroup.Values[ordererAddresses.Key()].Value = protoutil.MarshalOrPanic(ordererAddresses.Value())
+	confEnv.Config.ChannelGroup.Values[ordererAddresses.Key()] = &common.ConfigValue{
+		Value:     protoutil.MarshalOrPanic(ordererAddresses.Value()),
+		ModPolicy: "/Channel/Orderer/Admins",
+	}
 	// Remove the per org addresses, if applicable
 	ordererGrps := confEnv.Config.ChannelGroup.Groups[channelconfig.OrdererGroupKey].Groups
 	for _, grp := range ordererGrps {
@@ -1108,11 +1107,11 @@ func injectGlobalOrdererEndpoint(t *testing.T, block *common.Block, endpoint str
 func injectTLSCACert(t *testing.T, block *common.Block, tlsCA []byte) {
 	// Unwrap the layers until we reach the TLS CA certificates
 	env, err := protoutil.ExtractEnvelope(block, 0)
-	assert.NoError(t, err)
-	payload, err := protoutil.ExtractPayload(env)
-	assert.NoError(t, err)
+	require.NoError(t, err)
+	payload, err := protoutil.UnmarshalPayload(env.Payload)
+	require.NoError(t, err)
 	confEnv, err := configtx.UnmarshalConfigEnvelope(payload.Data)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	mspKey := confEnv.Config.ChannelGroup.Groups[channelconfig.OrdererGroupKey].Groups["OrdererOrg"].Values[channelconfig.MSPKey]
 	rawMSPConfig := mspKey.Value
 	mspConf := &msp.MSPConfig{}
@@ -1129,12 +1128,13 @@ func injectTLSCACert(t *testing.T, block *common.Block, tlsCA []byte) {
 	block.Data.Data[0] = protoutil.MarshalOrPanic(env)
 }
 
-func TestIsNewChannelBlock(t *testing.T) {
+func TestExtractGenesisBlock(t *testing.T) {
 	for _, testCase := range []struct {
-		name         string
-		expectedErr  string
-		returnedName string
-		block        *common.Block
+		name               string
+		expectedErr        string
+		returnedName       string
+		block              *common.Block
+		returnGenesisBlock bool
 	}{
 		{
 			name:        "nil block",
@@ -1157,7 +1157,7 @@ func TestIsNewChannelBlock(t *testing.T) {
 		},
 		{
 			name:        "corrupt payload in envelope",
-			expectedErr: "no payload in envelope: proto: common.Payload: illegal tag 0 (wire type 1)",
+			expectedErr: "error unmarshaling Payload: proto: common.Payload: illegal tag 0 (wire type 1)",
 			block: &common.Block{
 				Data: &common.BlockData{
 					Data: [][]byte{protoutil.MarshalOrPanic(&common.Envelope{
@@ -1374,16 +1374,22 @@ func TestIsNewChannelBlock(t *testing.T) {
 					})},
 				},
 			},
+			returnGenesisBlock: true,
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			channelName, err := cluster.IsNewChannelBlock(testCase.block)
+			channelName, gb, err := cluster.ExtractGenesisBlock(flogging.MustGetLogger("test"), testCase.block)
 			if testCase.expectedErr != "" {
-				assert.EqualError(t, err, testCase.expectedErr)
+				require.EqualError(t, err, testCase.expectedErr)
 			} else {
-				assert.NoError(t, err)
+				require.NoError(t, err)
 			}
-			assert.Equal(t, testCase.returnedName, channelName)
+			require.Equal(t, testCase.returnedName, channelName)
+			if testCase.returnGenesisBlock {
+				require.NotNil(t, gb)
+			} else {
+				require.Nil(t, gb)
+			}
 		})
 	}
 }
@@ -1430,17 +1436,17 @@ func TestChannels(t *testing.T) {
 			assertion: func(t *testing.T, ci *cluster.ChainInspector) {
 				actual := cluster.GenesisBlocks(ci.Channels())
 				// Assert that the returned channels are returned in any order
-				assert.Contains(t, [][]string{{"mychannel", "mychannel2"}, {"mychannel2", "mychannel"}}, actual.Names())
+				require.Contains(t, [][]string{{"mychannel", "mychannel2"}, {"mychannel2", "mychannel"}}, actual.Names())
 			},
 		},
 		{
 			name: "happy path - one block is not artificial but real",
 			prepareSystemChain: func(systemChain []*common.Block) {
 				blockbytes, err := ioutil.ReadFile(filepath.Join("testdata", "block3.pb"))
-				assert.NoError(t, err)
+				require.NoError(t, err)
 				block := &common.Block{}
 				err = proto.Unmarshal(blockbytes, block)
-				assert.NoError(t, err)
+				require.NoError(t, err)
 
 				systemChain[len(systemChain)/2-1] = block
 				assignHashes(systemChain)
@@ -1448,7 +1454,7 @@ func TestChannels(t *testing.T) {
 			assertion: func(t *testing.T, ci *cluster.ChainInspector) {
 				actual := cluster.GenesisBlocks(ci.Channels())
 				// Assert that the returned channels are returned in any order
-				assert.Contains(t, [][]string{{"mychannel2", "bar"}, {"bar", "mychannel2"}}, actual.Names())
+				require.Contains(t, [][]string{{"mychannel2", "bar"}, {"bar", "mychannel2"}}, actual.Names())
 			},
 		},
 		{
@@ -1461,7 +1467,7 @@ func TestChannels(t *testing.T) {
 				panicValue := "System channel pulled doesn't match the boot last config block:" +
 					" block [2]'s hash (bc4ef5cc8a61ac0747cc82df58bac9ad3278622c1cfc7a119b9b1068e422c9f1)" +
 					" mismatches block [3]'s prev block hash ()"
-				assert.PanicsWithValue(t, panicValue, func() {
+				require.PanicsWithValue(t, panicValue, func() {
 					ci.Channels()
 				})
 			},
@@ -1475,7 +1481,7 @@ func TestChannels(t *testing.T) {
 			assertion: func(t *testing.T, ci *cluster.ChainInspector) {
 				panicValue := "Claimed previous hash of block [2] is  but actual previous " +
 					"hash is 920faeb0bd8a02b3f2553247359fb3b684819c75c6e5487bc7eed632841ddc5f"
-				assert.PanicsWithValue(t, panicValue, func() {
+				require.PanicsWithValue(t, panicValue, func() {
 					ci.Channels()
 				})
 			},
@@ -1487,10 +1493,10 @@ func TestChannels(t *testing.T) {
 				systemChain[len(systemChain)-2].Data.Data = [][]byte{{1, 2, 3}}
 			},
 			assertion: func(t *testing.T, ci *cluster.ChainInspector) {
-				panicValue := "Failed classifying block [2]: block data does not carry" +
-					" an envelope at index 0: error unmarshaling Envelope: " +
-					"proto: common.Envelope: illegal tag 0 (wire type 1)"
-				assert.PanicsWithValue(t, panicValue, func() {
+				panicValue := "Failed extracting channel genesis block from config block: " +
+					"block data does not carry an envelope at index 0: error unmarshaling " +
+					"Envelope: proto: common.Envelope: illegal tag 0 (wire type 1)"
+				require.PanicsWithValue(t, panicValue, func() {
 					ci.Channels()
 				})
 			},
@@ -1505,7 +1511,7 @@ func TestChannels(t *testing.T) {
 			},
 			assertion: func(t *testing.T, ci *cluster.ChainInspector) {
 				panicValue := "Failed pulling block [2] from the system channel"
-				assert.PanicsWithValue(t, panicValue, func() {
+				require.PanicsWithValue(t, panicValue, func() {
 					ci.Channels()
 				})
 			},
@@ -1596,51 +1602,10 @@ func simulateNonParticipantChannelPull(osn *deliverServer) {
 	osn.blockResponses <- nil
 }
 
-func TestChannelCreationBlockToGenesisBlock(t *testing.T) {
-	for _, testCase := range []struct {
-		name        string
-		expectedErr string
-		block       *common.Block
-	}{
-		{
-			name:        "nil block",
-			expectedErr: "nil block",
-		},
-		{
-			name:        "no data",
-			expectedErr: "block data is nil",
-			block:       &common.Block{},
-		},
-		{
-			name:        "no block data",
-			expectedErr: "envelope index out of bounds",
-			block: &common.Block{
-				Data: &common.BlockData{},
-			},
-		},
-		{
-			name: "bad block data",
-			expectedErr: "block data does not carry an envelope at index 0:" +
-				" error unmarshaling Envelope: proto: common.Envelope:" +
-				" illegal tag 0 (wire type 1)",
-			block: &common.Block{
-				Data: &common.BlockData{
-					Data: [][]byte{{1, 2, 3}},
-				},
-			},
-		},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			_, err := cluster.ChannelCreationBlockToGenesisBlock(testCase.block)
-			assert.EqualError(t, err, testCase.expectedErr)
-		})
-	}
-}
-
 func TestFilter(t *testing.T) {
 	logger := flogging.MustGetLogger("test")
 	logger = logger.WithOptions(zap.Hooks(func(entry zapcore.Entry) error {
-		assert.Equal(t, "Channel foo shouldn't be pulled. Skipping it", entry.Message)
+		require.Equal(t, "Channel foo shouldn't be pulled. Skipping it", entry.Message)
 		return nil
 	}))
 
@@ -1650,5 +1615,5 @@ func TestFilter(t *testing.T) {
 		},
 		Logger: logger,
 	}
-	assert.Equal(t, cluster.ErrSkipped, r.PullChannel("foo"))
+	require.Equal(t, cluster.ErrSkipped, r.PullChannel("foo"))
 }

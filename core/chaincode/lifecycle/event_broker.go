@@ -1,5 +1,6 @@
 /*
 Copyright IBM Corp. All Rights Reserved.
+
 SPDX-License-Identifier: Apache-2.0
 */
 
@@ -8,7 +9,7 @@ package lifecycle
 import (
 	"sync"
 
-	ccpersistence "github.com/hyperledger/fabric/core/chaincode/persistence/intf"
+	"github.com/hyperledger/fabric/core/container/externalbuilder"
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/pkg/errors"
 )
@@ -16,6 +17,7 @@ import (
 // EventBroker receives events from lifecycle cache and in turn invokes the registered listeners
 type EventBroker struct {
 	chaincodeStore       ChaincodeStore
+	ebMetadata           *externalbuilder.MetadataProvider
 	pkgParser            PackageParser
 	defineCallbackStatus *sync.Map
 
@@ -23,9 +25,10 @@ type EventBroker struct {
 	listeners map[string][]ledger.ChaincodeLifecycleEventListener
 }
 
-func NewEventBroker(chaincodeStore ChaincodeStore, pkgParser PackageParser) *EventBroker {
+func NewEventBroker(chaincodeStore ChaincodeStore, pkgParser PackageParser, ebMetadata *externalbuilder.MetadataProvider) *EventBroker {
 	return &EventBroker{
 		chaincodeStore:       chaincodeStore,
+		ebMetadata:           ebMetadata,
 		pkgParser:            pkgParser,
 		listeners:            make(map[string][]ledger.ChaincodeLifecycleEventListener),
 		defineCallbackStatus: &sync.Map{},
@@ -68,19 +71,18 @@ func (b *EventBroker) ProcessInstallEvent(localChaincode *LocalChaincode) {
 			// the install will proceed and finally will, give a call back whether the install
 			// is succeeded.
 			// The purpose of splitting this in two phases was to essentially not miss on an install
-			// event in the case of a system crash immediatly after install and before the listeners
+			// event in the case of a system crash immediately after install and before the listeners
 			// gets a chance.
 			// However, in the current install model, the lifecycle cache receives the event only after
 			// the install is complete. So, for now, call the done on the listeners with a hard-wired 'true'
 			b.invokeDoneOnListeners(channelID, true)
 		}
 	}
-	return
 }
 
 // ProcessApproveOrDefineEvent gets invoked by an event that makes approve and define to be true
 // This should be OK even if this function gets invoked on defined and approved events separately because
-// the first check in this fucntion evaluates the final condition. However, the current cache implementation
+// the first check in this function evaluates the final condition. However, the current cache implementation
 // invokes this function when approve and define both become true.
 func (b *EventBroker) ProcessApproveOrDefineEvent(channelID string, chaincodeName string, cachedChaincode *CachedChaincodeDefinition) {
 	logger.Debugw("processApproveOrDefineEvent()", "channelID", channelID, "chaincodeName", chaincodeName, "cachedChaincode", cachedChaincode)
@@ -101,10 +103,9 @@ func (b *EventBroker) ProcessApproveOrDefineEvent(channelID string, chaincodeNam
 	}
 	b.invokeListeners(channelID, ccdef, dbArtifacts)
 	b.defineCallbackStatus.Store(channelID, struct{}{})
-	return
 }
 
-// ApproveOrDefineCommitted gets invoked after the commit of state updates that triggered the invocaiton of
+// ApproveOrDefineCommitted gets invoked after the commit of state updates that triggered the invocation of
 // "ProcessApproveOrDefineEvent" function
 func (b *EventBroker) ApproveOrDefineCommitted(channelID string) {
 	_, ok := b.defineCallbackStatus.Load(channelID)
@@ -154,7 +155,16 @@ func (b *EventBroker) invokeDoneOnListeners(channelID string, succeeded bool) {
 	}
 }
 
-func (b *EventBroker) loadDBArtifacts(packageID ccpersistence.PackageID) ([]byte, error) {
+func (b *EventBroker) loadDBArtifacts(packageID string) ([]byte, error) {
+	md, err := b.ebMetadata.PackageMetadata(packageID)
+	if err != nil {
+		return nil, err
+	}
+
+	if md != nil {
+		return md, nil
+	}
+
 	pkgBytes, err := b.chaincodeStore.Load(packageID)
 	if err != nil {
 		return nil, err

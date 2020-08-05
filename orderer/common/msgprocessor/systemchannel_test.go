@@ -11,48 +11,58 @@ import (
 	"testing"
 
 	"github.com/golang/protobuf/proto"
+	cb "github.com/hyperledger/fabric-protos-go/common"
+	"github.com/hyperledger/fabric-protos-go/orderer"
+	"github.com/hyperledger/fabric/bccsp/sw"
 	"github.com/hyperledger/fabric/common/capabilities"
 	"github.com/hyperledger/fabric/common/channelconfig"
-	mockchannelconfig "github.com/hyperledger/fabric/common/mocks/config"
-	mockconfig "github.com/hyperledger/fabric/common/mocks/config"
-	mockconfigtx "github.com/hyperledger/fabric/common/mocks/configtx"
-	"github.com/hyperledger/fabric/internal/configtxgen/configtxgentest"
+	"github.com/hyperledger/fabric/core/config/configtest"
 	"github.com/hyperledger/fabric/internal/configtxgen/encoder"
-	genesisconfig "github.com/hyperledger/fabric/internal/configtxgen/localconfig"
+	"github.com/hyperledger/fabric/internal/configtxgen/genesisconfig"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
-	cb "github.com/hyperledger/fabric/protos/common"
+	"github.com/hyperledger/fabric/orderer/common/msgprocessor/mocks"
 	"github.com/hyperledger/fabric/protoutil"
-	"github.com/stretchr/testify/assert"
+	"github.com/pkg/errors"
 	"github.com/stretchr/testify/require"
 )
 
 type mockSystemChannelSupport struct {
-	NewChannelConfigVal *mockconfigtx.Validator
+	NewChannelConfigVal *mocks.ConfigTXValidator
 	NewChannelConfigErr error
 }
 
+func newMockConfigTXValidator(err error) *mocks.ConfigTXValidator {
+	mockValidator := &mocks.ConfigTXValidator{}
+	mockValidator.ProposeConfigUpdateReturns(&cb.ConfigEnvelope{}, err)
+	return mockValidator
+}
+
 func (mscs *mockSystemChannelSupport) NewChannelConfig(env *cb.Envelope) (channelconfig.Resources, error) {
-	return &mockchannelconfig.Resources{
-		ConfigtxValidatorVal: mscs.NewChannelConfigVal,
-	}, mscs.NewChannelConfigErr
+	mockResources := &mocks.Resources{}
+	mockResources.ConfigtxValidatorReturns(mscs.NewChannelConfigVal)
+	return mockResources, mscs.NewChannelConfigErr
 }
 
 func TestProcessSystemChannelNormalMsg(t *testing.T) {
 	t.Run("Missing header", func(t *testing.T) {
 		mscs := &mockSystemChannelSupport{}
 		ms := &mockSystemChannelFilterSupport{
-			OrdererConfigVal: &mockconfig.Orderer{},
+			OrdererConfigVal: &mocks.OrdererConfig{},
 		}
-		_, err := NewSystemChannel(ms, mscs, nil).ProcessNormalMsg(&cb.Envelope{})
-		assert.NotNil(t, err)
-		assert.Regexp(t, "header not set", err.Error())
+		cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+		require.NoError(t, err)
+		_, err = NewSystemChannel(ms, mscs, nil, cryptoProvider).ProcessNormalMsg(&cb.Envelope{})
+		require.NotNil(t, err)
+		require.Regexp(t, "header not set", err.Error())
 	})
 	t.Run("Mismatched channel ID", func(t *testing.T) {
 		mscs := &mockSystemChannelSupport{}
 		ms := &mockSystemChannelFilterSupport{
-			OrdererConfigVal: &mockconfig.Orderer{},
+			OrdererConfigVal: &mocks.OrdererConfig{},
 		}
-		_, err := NewSystemChannel(ms, mscs, nil).ProcessNormalMsg(&cb.Envelope{
+		cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+		require.NoError(t, err)
+		_, err = NewSystemChannel(ms, mscs, nil, cryptoProvider).ProcessNormalMsg(&cb.Envelope{
 			Payload: protoutil.MarshalOrPanic(&cb.Payload{
 				Header: &cb.Header{
 					ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{
@@ -61,17 +71,17 @@ func TestProcessSystemChannelNormalMsg(t *testing.T) {
 				},
 			}),
 		})
-		assert.Equal(t, ErrChannelDoesNotExist, err)
+		require.Equal(t, ErrChannelDoesNotExist, err)
 	})
 	t.Run("Good", func(t *testing.T) {
 		mscs := &mockSystemChannelSupport{}
 		ms := &mockSystemChannelFilterSupport{
-			SequenceVal: 7,
-			OrdererConfigVal: &mockconfig.Orderer{
-				CapabilitiesVal: &mockconfig.OrdererCapabilities{ConsensusTypeMigrationVal: true},
-			},
+			SequenceVal:      7,
+			OrdererConfigVal: newMockOrdererConfig(true, orderer.ConsensusType_STATE_NORMAL),
 		}
-		cs, err := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule})).ProcessNormalMsg(&cb.Envelope{
+		cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+		require.NoError(t, err)
+		cs, err := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule}), cryptoProvider).ProcessNormalMsg(&cb.Envelope{
 			Payload: protoutil.MarshalOrPanic(&cb.Payload{
 				Header: &cb.Header{
 					ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{
@@ -80,8 +90,8 @@ func TestProcessSystemChannelNormalMsg(t *testing.T) {
 				},
 			}),
 		})
-		assert.Nil(t, err)
-		assert.Equal(t, ms.SequenceVal, cs)
+		require.Nil(t, err)
+		require.Equal(t, ms.SequenceVal, cs)
 
 	})
 }
@@ -90,22 +100,24 @@ func TestSystemChannelConfigUpdateMsg(t *testing.T) {
 	t.Run("Missing header", func(t *testing.T) {
 		mscs := &mockSystemChannelSupport{}
 		ms := &mockSystemChannelFilterSupport{
-			OrdererConfigVal: &mockconfig.Orderer{},
+			OrdererConfigVal: &mocks.OrdererConfig{},
 		}
-		_, _, err := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule})).ProcessConfigUpdateMsg(&cb.Envelope{})
-		assert.NotNil(t, err)
-		assert.Regexp(t, "header not set", err.Error())
+		cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+		require.NoError(t, err)
+		_, _, err = NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule}), cryptoProvider).ProcessConfigUpdateMsg(&cb.Envelope{})
+		require.NotNil(t, err)
+		require.Regexp(t, "header not set", err.Error())
 	})
 	t.Run("NormalUpdate", func(t *testing.T) {
 		mscs := &mockSystemChannelSupport{}
 		ms := &mockSystemChannelFilterSupport{
 			SequenceVal:            7,
 			ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-			OrdererConfigVal: &mockconfig.Orderer{
-				CapabilitiesVal: &mockconfig.OrdererCapabilities{ConsensusTypeMigrationVal: true},
-			},
+			OrdererConfigVal:       newMockOrdererConfig(true, orderer.ConsensusType_STATE_NORMAL),
 		}
-		sysChan := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule}))
+		cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+		require.NoError(t, err)
+		sysChan := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule}), cryptoProvider)
 		sysChan.maintenanceFilter = AcceptRule
 		config, cs, err := sysChan.ProcessConfigUpdateMsg(&cb.Envelope{
 			Payload: protoutil.MarshalOrPanic(&cb.Payload{
@@ -116,9 +128,9 @@ func TestSystemChannelConfigUpdateMsg(t *testing.T) {
 				},
 			}),
 		})
-		assert.NotNil(t, config)
-		assert.Equal(t, cs, ms.SequenceVal)
-		assert.Nil(t, err)
+		require.NotNil(t, config)
+		require.Equal(t, cs, ms.SequenceVal)
+		require.Nil(t, err)
 	})
 	t.Run("BadNewChannelConfig", func(t *testing.T) {
 		mscs := &mockSystemChannelSupport{
@@ -126,9 +138,11 @@ func TestSystemChannelConfigUpdateMsg(t *testing.T) {
 		}
 		ms := &mockSystemChannelFilterSupport{
 			ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-			OrdererConfigVal:       &mockconfig.Orderer{},
+			OrdererConfigVal:       &mocks.OrdererConfig{},
 		}
-		_, _, err := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule})).ProcessConfigUpdateMsg(&cb.Envelope{
+		cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+		require.NoError(t, err)
+		_, _, err = NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule}), cryptoProvider).ProcessConfigUpdateMsg(&cb.Envelope{
 			Payload: protoutil.MarshalOrPanic(&cb.Payload{
 				Header: &cb.Header{
 					ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{
@@ -137,19 +151,19 @@ func TestSystemChannelConfigUpdateMsg(t *testing.T) {
 				},
 			}),
 		})
-		assert.Equal(t, mscs.NewChannelConfigErr, err)
+		require.Equal(t, mscs.NewChannelConfigErr, err)
 	})
 	t.Run("BadProposedUpdate", func(t *testing.T) {
 		mscs := &mockSystemChannelSupport{
-			NewChannelConfigVal: &mockconfigtx.Validator{
-				ProposeConfigUpdateError: fmt.Errorf("An error"),
-			},
+			NewChannelConfigVal: newMockConfigTXValidator(fmt.Errorf("An error")),
 		}
 		ms := &mockSystemChannelFilterSupport{
 			ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-			OrdererConfigVal:       &mockconfig.Orderer{},
+			OrdererConfigVal:       &mocks.OrdererConfig{},
 		}
-		_, _, err := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule})).ProcessConfigUpdateMsg(&cb.Envelope{
+		cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+		require.NoError(t, err)
+		_, _, err = NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule}), cryptoProvider).ProcessConfigUpdateMsg(&cb.Envelope{
 			Payload: protoutil.MarshalOrPanic(&cb.Payload{
 				Header: &cb.Header{
 					ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{
@@ -158,17 +172,19 @@ func TestSystemChannelConfigUpdateMsg(t *testing.T) {
 				},
 			}),
 		})
-		assert.EqualError(t, err, "error validating channel creation transaction for new channel 'foodifferent', could not successfully apply update to template configuration: An error")
+		require.EqualError(t, err, "error validating channel creation transaction for new channel 'foodifferent', could not successfully apply update to template configuration: An error")
 	})
 	t.Run("BadSignEnvelope", func(t *testing.T) {
 		mscs := &mockSystemChannelSupport{
-			NewChannelConfigVal: &mockconfigtx.Validator{},
+			NewChannelConfigVal: &mocks.ConfigTXValidator{},
 		}
 		ms := &mockSystemChannelFilterSupport{
 			ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-			OrdererConfigVal:       &mockconfig.Orderer{},
+			OrdererConfigVal:       &mocks.OrdererConfig{},
 		}
-		_, _, err := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule})).ProcessConfigUpdateMsg(&cb.Envelope{
+		cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+		require.NoError(t, err)
+		_, _, err = NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule}), cryptoProvider).ProcessConfigUpdateMsg(&cb.Envelope{
 			Payload: protoutil.MarshalOrPanic(&cb.Payload{
 				Header: &cb.Header{
 					ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{
@@ -177,20 +193,20 @@ func TestSystemChannelConfigUpdateMsg(t *testing.T) {
 				},
 			}),
 		})
-		assert.Regexp(t, "Marshal called with nil", err)
+		require.Regexp(t, "Marshal called with nil", err)
 	})
 	t.Run("BadByFilter", func(t *testing.T) {
 		mscs := &mockSystemChannelSupport{
-			NewChannelConfigVal: &mockconfigtx.Validator{
-				ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-			},
+			NewChannelConfigVal: newMockConfigTXValidator(nil),
 		}
 		ms := &mockSystemChannelFilterSupport{
 			SequenceVal:            7,
 			ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-			OrdererConfigVal:       &mockconfig.Orderer{},
+			OrdererConfigVal:       &mocks.OrdererConfig{},
 		}
-		_, _, err := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{RejectRule})).ProcessConfigUpdateMsg(&cb.Envelope{
+		cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+		require.NoError(t, err)
+		_, _, err = NewSystemChannel(ms, mscs, NewRuleSet([]Rule{RejectRule}), cryptoProvider).ProcessConfigUpdateMsg(&cb.Envelope{
 			Payload: protoutil.MarshalOrPanic(&cb.Payload{
 				Header: &cb.Header{
 					ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{
@@ -199,22 +215,22 @@ func TestSystemChannelConfigUpdateMsg(t *testing.T) {
 				},
 			}),
 		})
-		assert.Equal(t, RejectRule.Apply(nil), err)
+		require.Equal(t, RejectRule.Apply(nil), err)
 	})
 	t.Run("RejectByMaintenance", func(t *testing.T) {
 		mscs := &mockSystemChannelSupport{
-			NewChannelConfigVal: &mockconfigtx.Validator{
-				ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-			},
+			NewChannelConfigVal: newMockConfigTXValidator(nil),
 		}
 		ms := &mockSystemChannelFilterSupport{
 			SequenceVal:            7,
 			ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-			OrdererConfigVal:       &mockconfig.Orderer{},
+			OrdererConfigVal:       &mocks.OrdererConfig{},
 		}
-		sysChan := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule}))
+		cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+		require.NoError(t, err)
+		sysChan := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule}), cryptoProvider)
 		sysChan.maintenanceFilter = RejectRule
-		_, _, err := sysChan.ProcessConfigUpdateMsg(&cb.Envelope{
+		_, _, err = sysChan.ProcessConfigUpdateMsg(&cb.Envelope{
 			Payload: protoutil.MarshalOrPanic(&cb.Payload{
 				Header: &cb.Header{
 					ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{
@@ -223,20 +239,20 @@ func TestSystemChannelConfigUpdateMsg(t *testing.T) {
 				},
 			}),
 		})
-		assert.Equal(t, RejectRule.Apply(nil), err)
+		require.Equal(t, RejectRule.Apply(nil), errors.Cause(err))
 	})
 	t.Run("Good", func(t *testing.T) {
 		mscs := &mockSystemChannelSupport{
-			NewChannelConfigVal: &mockconfigtx.Validator{
-				ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-			},
+			NewChannelConfigVal: newMockConfigTXValidator(nil),
 		}
 		ms := &mockSystemChannelFilterSupport{
 			SequenceVal:            7,
 			ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-			OrdererConfigVal:       &mockconfig.Orderer{},
+			OrdererConfigVal:       &mocks.OrdererConfig{},
 		}
-		config, cs, err := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule})).ProcessConfigUpdateMsg(&cb.Envelope{
+		cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+		require.NoError(t, err)
+		config, cs, err := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule}), cryptoProvider).ProcessConfigUpdateMsg(&cb.Envelope{
 			Payload: protoutil.MarshalOrPanic(&cb.Payload{
 				Header: &cb.Header{
 					ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{
@@ -245,9 +261,9 @@ func TestSystemChannelConfigUpdateMsg(t *testing.T) {
 				},
 			}),
 		})
-		assert.Equal(t, cs, ms.SequenceVal)
-		assert.NotNil(t, config)
-		assert.Nil(t, err)
+		require.Equal(t, cs, ms.SequenceVal)
+		require.NotNil(t, config)
+		require.Nil(t, err)
 	})
 }
 
@@ -255,16 +271,16 @@ func TestSystemChannelConfigMsg(t *testing.T) {
 	t.Run("ConfigMsg", func(t *testing.T) {
 		t.Run("BadPayloadData", func(t *testing.T) {
 			mscs := &mockSystemChannelSupport{
-				NewChannelConfigVal: &mockconfigtx.Validator{
-					ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-				},
+				NewChannelConfigVal: newMockConfigTXValidator(nil),
 			}
 			ms := &mockSystemChannelFilterSupport{
 				SequenceVal:            7,
 				ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-				OrdererConfigVal:       &mockconfig.Orderer{},
+				OrdererConfigVal:       &mocks.OrdererConfig{},
 			}
-			_, _, err := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule})).ProcessConfigMsg(&cb.Envelope{
+			cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+			require.NoError(t, err)
+			_, _, err = NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule}), cryptoProvider).ProcessConfigMsg(&cb.Envelope{
 				Payload: protoutil.MarshalOrPanic(&cb.Payload{
 					Header: &cb.Header{
 						ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{
@@ -275,23 +291,21 @@ func TestSystemChannelConfigMsg(t *testing.T) {
 					Data: []byte("hello"),
 				}),
 			})
-			assert.Error(t, err)
+			require.Error(t, err)
 		})
 
 		t.Run("Good", func(t *testing.T) {
 			mscs := &mockSystemChannelSupport{
-				NewChannelConfigVal: &mockconfigtx.Validator{
-					ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-				},
+				NewChannelConfigVal: newMockConfigTXValidator(nil),
 			}
 			ms := &mockSystemChannelFilterSupport{
 				SequenceVal:            7,
 				ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-				OrdererConfigVal: &mockconfig.Orderer{
-					CapabilitiesVal: &mockconfig.OrdererCapabilities{},
-				},
+				OrdererConfigVal:       newMockOrdererConfig(false, orderer.ConsensusType_STATE_NORMAL),
 			}
-			sysChan := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule}))
+			cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+			require.NoError(t, err)
+			sysChan := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule}), cryptoProvider)
 			sysChan.maintenanceFilter = AcceptRule
 			config, seq, err := sysChan.ProcessConfigMsg(&cb.Envelope{
 				Payload: protoutil.MarshalOrPanic(&cb.Payload{
@@ -303,12 +317,12 @@ func TestSystemChannelConfigMsg(t *testing.T) {
 					},
 				}),
 			})
-			assert.Equal(t, seq, ms.SequenceVal)
-			assert.NotNil(t, config)
-			assert.Nil(t, err)
+			require.Equal(t, seq, ms.SequenceVal)
+			require.NotNil(t, config)
+			require.Nil(t, err)
 			hdr, err := protoutil.ChannelHeader(config)
 			require.NoError(t, err)
-			assert.Equal(
+			require.Equal(
 				t,
 				int32(cb.HeaderType_CONFIG),
 				hdr.Type,
@@ -319,16 +333,16 @@ func TestSystemChannelConfigMsg(t *testing.T) {
 	t.Run("OrdererTxMsg", func(t *testing.T) {
 		t.Run("BadPayloadData", func(t *testing.T) {
 			mscs := &mockSystemChannelSupport{
-				NewChannelConfigVal: &mockconfigtx.Validator{
-					ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-				},
+				NewChannelConfigVal: newMockConfigTXValidator(nil),
 			}
 			ms := &mockSystemChannelFilterSupport{
 				SequenceVal:            7,
 				ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-				OrdererConfigVal:       &mockconfig.Orderer{},
+				OrdererConfigVal:       &mocks.OrdererConfig{},
 			}
-			_, _, err := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule})).ProcessConfigMsg(&cb.Envelope{
+			cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+			require.NoError(t, err)
+			_, _, err = NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule}), cryptoProvider).ProcessConfigMsg(&cb.Envelope{
 				Payload: protoutil.MarshalOrPanic(&cb.Payload{
 					Header: &cb.Header{
 						ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{
@@ -339,21 +353,21 @@ func TestSystemChannelConfigMsg(t *testing.T) {
 					Data: []byte("hello"),
 				}),
 			})
-			assert.Error(t, err)
+			require.Error(t, err)
 		})
 
 		t.Run("WrongEnvelopeType", func(t *testing.T) {
 			mscs := &mockSystemChannelSupport{
-				NewChannelConfigVal: &mockconfigtx.Validator{
-					ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-				},
+				NewChannelConfigVal: newMockConfigTXValidator(nil),
 			}
 			ms := &mockSystemChannelFilterSupport{
 				SequenceVal:            7,
 				ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-				OrdererConfigVal:       &mockconfig.Orderer{},
+				OrdererConfigVal:       &mocks.OrdererConfig{},
 			}
-			_, _, err := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule})).ProcessConfigMsg(&cb.Envelope{
+			cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+			require.NoError(t, err)
+			_, _, err = NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule}), cryptoProvider).ProcessConfigMsg(&cb.Envelope{
 				Payload: protoutil.MarshalOrPanic(&cb.Payload{
 					Header: &cb.Header{
 						ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{
@@ -373,21 +387,21 @@ func TestSystemChannelConfigMsg(t *testing.T) {
 					}),
 				}),
 			})
-			assert.Error(t, err)
+			require.Error(t, err)
 		})
 
 		t.Run("GoodConfigMsg", func(t *testing.T) {
 			mscs := &mockSystemChannelSupport{
-				NewChannelConfigVal: &mockconfigtx.Validator{
-					ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-				},
+				NewChannelConfigVal: newMockConfigTXValidator(nil),
 			}
 			ms := &mockSystemChannelFilterSupport{
 				SequenceVal:            7,
 				ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-				OrdererConfigVal:       &mockconfig.Orderer{},
+				OrdererConfigVal:       &mocks.OrdererConfig{},
 			}
-			config, seq, err := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule})).ProcessConfigMsg(&cb.Envelope{
+			cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+			require.NoError(t, err)
+			config, seq, err := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule}), cryptoProvider).ProcessConfigMsg(&cb.Envelope{
 				Payload: protoutil.MarshalOrPanic(&cb.Payload{
 					Header: &cb.Header{
 						ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{
@@ -419,11 +433,12 @@ func TestSystemChannelConfigMsg(t *testing.T) {
 					}),
 				}),
 			})
-			assert.Equal(t, seq, ms.SequenceVal)
-			assert.NotNil(t, config)
-			assert.Nil(t, err)
+			require.Equal(t, seq, ms.SequenceVal)
+			require.NotNil(t, config)
+			require.Nil(t, err)
 			hdr, err := protoutil.ChannelHeader(config)
-			assert.Equal(
+			require.NoError(t, err)
+			require.Equal(
 				t,
 				int32(cb.HeaderType_ORDERER_TRANSACTION),
 				hdr.Type,
@@ -433,16 +448,16 @@ func TestSystemChannelConfigMsg(t *testing.T) {
 
 	t.Run("OtherMsgType", func(t *testing.T) {
 		mscs := &mockSystemChannelSupport{
-			NewChannelConfigVal: &mockconfigtx.Validator{
-				ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-			},
+			NewChannelConfigVal: newMockConfigTXValidator(nil),
 		}
 		ms := &mockSystemChannelFilterSupport{
 			SequenceVal:            7,
 			ProposeConfigUpdateVal: &cb.ConfigEnvelope{},
-			OrdererConfigVal:       &mockconfig.Orderer{},
+			OrdererConfigVal:       &mocks.OrdererConfig{},
 		}
-		_, _, err := NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule})).ProcessConfigMsg(&cb.Envelope{
+		cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+		require.NoError(t, err)
+		_, _, err = NewSystemChannel(ms, mscs, NewRuleSet([]Rule{AcceptRule}), cryptoProvider).ProcessConfigMsg(&cb.Envelope{
 			Payload: protoutil.MarshalOrPanic(&cb.Payload{
 				Header: &cb.Header{
 					ChannelHeader: protoutil.MarshalOrPanic(&cb.ChannelHeader{
@@ -452,7 +467,7 @@ func TestSystemChannelConfigMsg(t *testing.T) {
 				},
 			}),
 		})
-		assert.Error(t, err)
+		require.Error(t, err)
 	})
 }
 
@@ -466,23 +481,27 @@ func (mdts *mockDefaultTemplatorSupport) Signer() identity.SignerSerializer {
 
 func TestNewChannelConfig(t *testing.T) {
 	channelID := "foo"
-	gConf := configtxgentest.Load(genesisconfig.SampleSingleMSPSoloProfile)
+	gConf := genesisconfig.Load(genesisconfig.SampleSingleMSPSoloProfile, configtest.GetDevConfigDir())
 	gConf.Orderer.Capabilities = map[string]bool{
 		capabilities.OrdererV2_0: true,
 	}
 	channelGroup, err := encoder.NewChannelGroup(gConf)
-	assert.NoError(t, err)
-	ctxm, err := channelconfig.NewBundle(channelID, &cb.Config{ChannelGroup: channelGroup})
+	require.NoError(t, err)
+
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+	ctxm, err := channelconfig.NewBundle(channelID, &cb.Config{ChannelGroup: channelGroup}, cryptoProvider)
+	require.NoError(t, err)
 
 	originalCG := proto.Clone(ctxm.ConfigtxValidator().ConfigProto().ChannelGroup).(*cb.ConfigGroup)
 
 	templator := NewDefaultTemplator(&mockDefaultTemplatorSupport{
 		Resources: ctxm,
-	})
+	}, cryptoProvider)
 
 	t.Run("BadPayload", func(t *testing.T) {
 		_, err := templator.NewChannelConfig(&cb.Envelope{Payload: []byte("bad payload")})
-		assert.Error(t, err, "Should not be able to create new channel config from bad payload.")
+		require.Error(t, err, "Should not be able to create new channel config from bad payload.")
 	})
 
 	for _, tc := range []struct {
@@ -717,33 +736,37 @@ func TestNewChannelConfig(t *testing.T) {
 					),
 				}),
 			},
-			"Attempted to include a member which is not in the consortium",
+			"Attempted to include member BadOrgName which is not in the consortium",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := templator.NewChannelConfig(&cb.Envelope{Payload: protoutil.MarshalOrPanic(tc.payload)})
-			if assert.Error(t, err) {
-				assert.Regexp(t, tc.regex, err.Error())
-			}
+			require.Error(t, err)
+			require.Regexp(t, tc.regex, err.Error())
 		})
 	}
 
 	// Successful
 	t.Run("Success", func(t *testing.T) {
-		createTx, err := encoder.MakeChannelCreationTransaction("foo", nil, configtxgentest.Load(genesisconfig.SampleSingleMSPChannelProfile))
-		assert.Nil(t, err)
+		createTx, err := encoder.MakeChannelCreationTransaction("foo", nil, genesisconfig.Load(genesisconfig.SampleSingleMSPChannelProfile, configtest.GetDevConfigDir()))
+		require.Nil(t, err)
 		res, err := templator.NewChannelConfig(createTx)
-		assert.Nil(t, err)
-		assert.NotEmpty(t, res.ConfigtxValidator().ConfigProto().ChannelGroup.ModPolicy)
-		assert.True(t, proto.Equal(originalCG, ctxm.ConfigtxValidator().ConfigProto().ChannelGroup), "Underlying system channel config proto was mutated")
+		require.Nil(t, err)
+		require.NotEmpty(t, res.ConfigtxValidator().ConfigProto().ChannelGroup.ModPolicy)
+		require.True(t, proto.Equal(originalCG, ctxm.ConfigtxValidator().ConfigProto().ChannelGroup), "Underlying system channel config proto was mutated")
 	})
 
 	// Successful new channel config type
 	t.Run("SuccessWithNewCreateType", func(t *testing.T) {
-		createTx, err := encoder.MakeChannelCreationTransactionWithSystemChannelContext("foo", nil, configtxgentest.Load(genesisconfig.SampleSingleMSPChannelProfile), configtxgentest.Load(genesisconfig.SampleSingleMSPSoloProfile))
-		assert.Nil(t, err)
+		createTx, err := encoder.MakeChannelCreationTransactionWithSystemChannelContext(
+			"foo",
+			nil,
+			genesisconfig.Load(genesisconfig.SampleSingleMSPChannelProfile, configtest.GetDevConfigDir()),
+			genesisconfig.Load(genesisconfig.SampleSingleMSPSoloProfile, configtest.GetDevConfigDir()),
+		)
+		require.Nil(t, err)
 		_, err = templator.NewChannelConfig(createTx)
-		assert.Nil(t, err)
+		require.Nil(t, err)
 	})
 }
 
@@ -809,5 +832,5 @@ func TestZeroVersions(t *testing.T) {
 
 	zeroVersions(data)
 
-	assert.True(t, proto.Equal(expected, data))
+	require.True(t, proto.Equal(expected, data))
 }

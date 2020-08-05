@@ -12,13 +12,14 @@ import (
 	"testing"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/hyperledger/fabric/common/cauthdsl"
+	"github.com/hyperledger/fabric-protos-go/common"
+	mspprotos "github.com/hyperledger/fabric-protos-go/msp"
+	"github.com/hyperledger/fabric-protos-go/peer"
+	"github.com/hyperledger/fabric/bccsp/sw"
+	"github.com/hyperledger/fabric/common/policydsl"
 	"github.com/hyperledger/fabric/msp"
 	mspmgmt "github.com/hyperledger/fabric/msp/mgmt"
 	msptesttools "github.com/hyperledger/fabric/msp/mgmt/testtools"
-	"github.com/hyperledger/fabric/protos/common"
-	mspprotos "github.com/hyperledger/fabric/protos/msp"
-	"github.com/hyperledger/fabric/protos/peer"
 	"github.com/hyperledger/fabric/protoutil"
 )
 
@@ -32,12 +33,12 @@ func createInstantiationPolicy(mspid string, role mspprotos.MSPRole_MSPRoleType)
 	principals := []*mspprotos.MSPPrincipal{{
 		PrincipalClassification: mspprotos.MSPPrincipal_ROLE,
 		Principal:               protoutil.MarshalOrPanic(&mspprotos.MSPRole{Role: role, MspIdentifier: mspid})}}
-	sigspolicy := []*common.SignaturePolicy{cauthdsl.SignedBy(int32(0))}
+	sigspolicy := []*common.SignaturePolicy{policydsl.SignedBy(int32(0))}
 
 	// create the policy: it requires exactly 1 signature from any of the principals
 	p := &common.SignaturePolicyEnvelope{
 		Version:    0,
-		Rule:       cauthdsl.NOutOf(1, sigspolicy),
+		Rule:       policydsl.NOutOf(1, sigspolicy),
 		Identities: principals,
 	}
 
@@ -288,7 +289,14 @@ func TestMain(m *testing.M) {
 		fmt.Printf("Could not initialize msp")
 		return
 	}
-	localmsp = mspmgmt.GetLocalMSP()
+
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	if err != nil {
+		fmt.Printf("Initialize cryptoProvider bccsp failed: %s", cryptoProvider)
+		os.Exit(-1)
+		return
+	}
+	localmsp = mspmgmt.GetLocalMSP(cryptoProvider)
 	if localmsp == nil {
 		os.Exit(-1)
 		fmt.Printf("Could not get msp")

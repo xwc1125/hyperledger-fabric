@@ -8,11 +8,11 @@ package channelconfig
 import (
 	"testing"
 
-	cb "github.com/hyperledger/fabric/protos/common"
-	"github.com/stretchr/testify/assert"
+	cb "github.com/hyperledger/fabric-protos-go/common"
+	"github.com/stretchr/testify/require"
 )
 
 func TestConsortiums(t *testing.T) {
 	_, err := NewConsortiumsConfig(&cb.ConfigGroup{}, nil)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 }

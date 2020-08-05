@@ -7,9 +7,9 @@ SPDX-License-Identifier: Apache-2.0
 package kvledger
 
 import (
+	"github.com/hyperledger/fabric-protos-go/ledger/rwset/kvrwset"
+	"github.com/hyperledger/fabric-protos-go/peer"
 	"github.com/hyperledger/fabric/core/ledger"
-	"github.com/hyperledger/fabric/protos/common"
-	"github.com/hyperledger/fabric/protos/ledger/rwset/kvrwset"
 )
 
 // collElgNotifier listens for the chaincode events and determines whether the peer has become eligible for one or more existing
@@ -18,6 +18,11 @@ type collElgNotifier struct {
 	deployedChaincodeInfoProvider ledger.DeployedChaincodeInfoProvider
 	membershipInfoProvider        ledger.MembershipInfoProvider
 	listeners                     map[string]collElgListener
+}
+
+// Name returns the name of the listener
+func (n *collElgNotifier) Name() string {
+	return "collection eligibility listener"
 }
 
 func (n *collElgNotifier) Initialize(ledgerID string, qe ledger.SimpleQueryExecutor) error {
@@ -77,7 +82,7 @@ func (n *collElgNotifier) HandleStateUpdates(trigger *ledger.StateUpdateTrigger)
 		}
 	}
 	if len(nsCollMap) > 0 {
-		n.invokeLedgerSpecificNotifier(trigger.LedgerID, trigger.CommittingBlockNum, nsCollMap)
+		return n.invokeLedgerSpecificNotifier(trigger.LedgerID, trigger.CommittingBlockNum, nsCollMap)
 	}
 	return nil
 }
@@ -86,19 +91,19 @@ func (n *collElgNotifier) registerListener(ledgerID string, listener collElgList
 	n.listeners[ledgerID] = listener
 }
 
-func (n *collElgNotifier) invokeLedgerSpecificNotifier(ledgerID string, commtingBlk uint64, nsCollMap map[string][]string) {
+func (n *collElgNotifier) invokeLedgerSpecificNotifier(ledgerID string, commtingBlk uint64, nsCollMap map[string][]string) error {
 	listener := n.listeners[ledgerID]
-	listener.ProcessCollsEligibilityEnabled(commtingBlk, nsCollMap)
+	return listener.ProcessCollsEligibilityEnabled(commtingBlk, nsCollMap)
 }
 
 // elgEnabledCollNames returns the names of the collections for which the peer is not eligible as per 'existingPkg' and is eligible as per 'postCommitPkg'
 func (n *collElgNotifier) elgEnabledCollNames(ledgerID string,
-	existingPkg, postCommitPkg *common.CollectionConfigPackage) ([]string, error) {
+	existingPkg, postCommitPkg *peer.CollectionConfigPackage) ([]string, error) {
 
 	collectionNames := []string{}
 	exisingConfs := retrieveCollConfs(existingPkg)
 	postCommitConfs := retrieveCollConfs(postCommitPkg)
-	existingConfMap := map[string]*common.StaticCollectionConfig{}
+	existingConfMap := map[string]*peer.StaticCollectionConfig{}
 	for _, existingConf := range exisingConfs {
 		existingConfMap[existingConf.Name] = existingConf
 	}
@@ -123,7 +128,7 @@ func (n *collElgNotifier) elgEnabledCollNames(ledgerID string,
 }
 
 // elgEnabled returns true if the peer is not eligible for a collection as per 'existingPolicy' and is eligible as per 'postCommitPolicy'
-func (n *collElgNotifier) elgEnabled(ledgerID string, existingPolicy, postCommitPolicy *common.CollectionPolicyConfig) (bool, error) {
+func (n *collElgNotifier) elgEnabled(ledgerID string, existingPolicy, postCommitPolicy *peer.CollectionPolicyConfig) (bool, error) {
 	existingMember, err := n.membershipInfoProvider.AmMemberOf(ledgerID, existingPolicy)
 	if err != nil || existingMember {
 		return false, err
@@ -148,11 +153,11 @@ type collElgListener interface {
 	ProcessCollsEligibilityEnabled(commitingBlk uint64, nsCollMap map[string][]string) error
 }
 
-func retrieveCollConfs(collConfPkg *common.CollectionConfigPackage) []*common.StaticCollectionConfig {
+func retrieveCollConfs(collConfPkg *peer.CollectionConfigPackage) []*peer.StaticCollectionConfig {
 	if collConfPkg == nil {
 		return nil
 	}
-	var staticCollConfs []*common.StaticCollectionConfig
+	var staticCollConfs []*peer.StaticCollectionConfig
 	protoConfArray := collConfPkg.Config
 	for _, protoConf := range protoConfArray {
 		staticCollConfs = append(staticCollConfs, protoConf.GetStaticCollectionConfig())

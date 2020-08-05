@@ -7,14 +7,17 @@ SPDX-License-Identifier: Apache-2.0
 package service
 
 import (
+	"fmt"
 	"sync"
 
-	corecomm "github.com/hyperledger/fabric/core/comm"
+	gproto "github.com/hyperledger/fabric-protos-go/gossip"
+	tspb "github.com/hyperledger/fabric-protos-go/transientstore"
+	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/core/committer"
 	"github.com/hyperledger/fabric/core/committer/txvalidator"
 	"github.com/hyperledger/fabric/core/common/privdata"
 	"github.com/hyperledger/fabric/core/deliverservice"
-	"github.com/hyperledger/fabric/core/deliverservice/blocksprovider"
+	"github.com/hyperledger/fabric/core/transientstore"
 	"github.com/hyperledger/fabric/gossip/api"
 	"github.com/hyperledger/fabric/gossip/comm"
 	"github.com/hyperledger/fabric/gossip/common"
@@ -28,9 +31,10 @@ import (
 	"github.com/hyperledger/fabric/gossip/protoext"
 	"github.com/hyperledger/fabric/gossip/state"
 	"github.com/hyperledger/fabric/gossip/util"
+	corecomm "github.com/hyperledger/fabric/internal/pkg/comm"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
-	gproto "github.com/hyperledger/fabric/protos/gossip"
-	"github.com/hyperledger/fabric/protos/transientstore"
+	"github.com/hyperledger/fabric/internal/pkg/peer/blocksprovider"
+	"github.com/hyperledger/fabric/internal/pkg/peer/orderers"
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
@@ -121,32 +125,26 @@ type GossipServiceAdapter interface {
 // DeliveryServiceFactory factory to create and initialize delivery service instance
 type DeliveryServiceFactory interface {
 	// Returns an instance of delivery client
-	Service(g GossipServiceAdapter, endpoints []string, msc api.MessageCryptoService) (deliverservice.DeliverService, error)
+	Service(g GossipServiceAdapter, ordererSource *orderers.ConnectionSource, msc api.MessageCryptoService, isStaticLead bool) deliverservice.DeliverService
 }
 
 type deliveryFactoryImpl struct {
-	signer                identity.SignerSerializer
-	credentialSupport     *corecomm.CredentialSupport
-	peerTLSEnabled        bool
-	deliverClientDialOpts []grpc.DialOption
+	signer               identity.SignerSerializer
+	credentialSupport    *corecomm.CredentialSupport
+	deliverGRPCClient    *corecomm.GRPCClient
+	deliverServiceConfig *deliverservice.DeliverServiceConfig
 }
 
 // Returns an instance of delivery client
-func (df *deliveryFactoryImpl) Service(g GossipServiceAdapter, endpoints []string, mcs api.MessageCryptoService) (deliverservice.DeliverService, error) {
+func (df *deliveryFactoryImpl) Service(g GossipServiceAdapter, ordererSource *orderers.ConnectionSource, mcs api.MessageCryptoService, isStaticLeader bool) deliverservice.DeliverService {
 	return deliverservice.NewDeliverService(&deliverservice.Config{
-		ABCFactory:        deliverservice.DefaultABCFactory,
-		CryptoSvc:         mcs,
-		CredentialSupport: df.credentialSupport,
-		Endpoints:         endpoints,
-		ConnFactory: (&deliverservice.CredSupportDialerFactory{
-			CredentialSupport: df.credentialSupport,
-			KeepaliveOptions:  deliverservice.KeepaliveOptions(),
-			TLSEnabled:        df.peerTLSEnabled,
-		}).Dialer,
-		Gossip:                g,
-		Signer:                df.signer,
-		PeerTLSEnabled:        df.peerTLSEnabled,
-		DeliverClientDialOpts: df.deliverClientDialOpts,
+		IsStaticLeader:       isStaticLeader,
+		CryptoSvc:            mcs,
+		Gossip:               g,
+		Signer:               df.signer,
+		DeliverGRPCClient:    df.deliverGRPCClient,
+		DeliverServiceConfig: df.deliverServiceConfig,
+		OrdererSource:        ordererSource,
 	})
 }
 
@@ -162,19 +160,22 @@ func (p privateHandler) close() {
 	p.reconciler.Stop()
 }
 
+// GossipService handles the interaction between gossip service and peer
 type GossipService struct {
 	gossipSvc
-	privateHandlers map[string]privateHandler
-	chains          map[string]state.GossipStateProvider
-	leaderElection  map[string]election.LeaderElectionService
-	deliveryService map[string]deliverservice.DeliverService
-	deliveryFactory DeliveryServiceFactory
-	lock            sync.RWMutex
-	mcs             api.MessageCryptoService
-	peerIdentity    []byte
-	secAdv          api.SecurityAdvisor
-	metrics         *gossipmetrics.GossipMetrics
-	serviceConfig   *ServiceConfig
+	privateHandlers   map[string]privateHandler
+	chains            map[string]state.GossipStateProvider
+	leaderElection    map[string]election.LeaderElectionService
+	deliveryService   map[string]deliverservice.DeliverService
+	deliveryFactory   DeliveryServiceFactory
+	lock              sync.RWMutex
+	mcs               api.MessageCryptoService
+	peerIdentity      []byte
+	secAdv            api.SecurityAdvisor
+	metrics           *gossipmetrics.GossipMetrics
+	serviceConfig     *ServiceConfig
+	privdataConfig    *gossipprivdata.PrivdataConfig
+	anchorPeerTracker *anchorPeerTracker
 }
 
 // This is an implementation of api.JoinChannelMessage.
@@ -201,6 +202,33 @@ func (jcm *joinChannelMessage) AnchorPeersOf(org api.OrgIdentityType) []api.Anch
 	return jcm.members2AnchorPeers[string(org)]
 }
 
+// anchorPeerTracker maintains anchor peer endpoints for all the channels.
+type anchorPeerTracker struct {
+	// allEndpoints contains anchor peer endpoints for all the channels,
+	// its key is channel name, value is map of anchor peer endpoints
+	allEndpoints map[string]map[string]struct{}
+	mutex        sync.RWMutex
+}
+
+// update overwrites the anchor peer endpoints for the channel
+func (t *anchorPeerTracker) update(channelName string, endpoints map[string]struct{}) {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	t.allEndpoints[channelName] = endpoints
+}
+
+// IsAnchorPeer checks if an endpoint is an anchor peer in any channel
+func (t *anchorPeerTracker) IsAnchorPeer(endpoint string) bool {
+	t.mutex.RLock()
+	defer t.mutex.RUnlock()
+	for _, endpointsForChannel := range t.allEndpoints {
+		if _, ok := endpointsForChannel[endpoint]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 var logger = util.GetLogger(util.ServiceLogger, "")
 
 // New creates the gossip service.
@@ -213,9 +241,11 @@ func New(
 	secAdv api.SecurityAdvisor,
 	secureDialOpts api.PeerSecureDialOpts,
 	credSupport *corecomm.CredentialSupport,
-	deliverClientDialOpts []grpc.DialOption,
+	deliverGRPCClient *corecomm.GRPCClient,
 	gossipConfig *gossip.Config,
 	serviceConfig *ServiceConfig,
+	privdataConfig *gossipprivdata.PrivdataConfig,
+	deliverServiceConfig *deliverservice.DeliverServiceConfig,
 ) (*GossipService, error) {
 	serializedIdentity, err := peerIdentity.Serialize()
 	if err != nil {
@@ -224,6 +254,7 @@ func New(
 
 	logger.Infof("Initialize gossip with endpoint %s", endpoint)
 
+	anchorPeerTracker := &anchorPeerTracker{allEndpoints: map[string]map[string]struct{}{}}
 	gossipComponent := gossip.New(
 		gossipConfig,
 		s,
@@ -232,6 +263,7 @@ func New(
 		serializedIdentity,
 		secureDialOpts,
 		gossipMetrics,
+		anchorPeerTracker,
 	)
 
 	return &GossipService{
@@ -242,20 +274,22 @@ func New(
 		leaderElection:  make(map[string]election.LeaderElectionService),
 		deliveryService: make(map[string]deliverservice.DeliverService),
 		deliveryFactory: &deliveryFactoryImpl{
-			signer:                peerIdentity,
-			credentialSupport:     credSupport,
-			peerTLSEnabled:        serviceConfig.PeerTLSEnabled,
-			deliverClientDialOpts: deliverClientDialOpts,
+			signer:               peerIdentity,
+			credentialSupport:    credSupport,
+			deliverGRPCClient:    deliverGRPCClient,
+			deliverServiceConfig: deliverServiceConfig,
 		},
-		peerIdentity:  serializedIdentity,
-		secAdv:        secAdv,
-		metrics:       gossipMetrics,
-		serviceConfig: serviceConfig,
+		peerIdentity:      serializedIdentity,
+		secAdv:            secAdv,
+		metrics:           gossipMetrics,
+		serviceConfig:     serviceConfig,
+		privdataConfig:    privdataConfig,
+		anchorPeerTracker: anchorPeerTracker,
 	}, nil
 }
 
 // DistributePrivateData distribute private read write set inside the channel based on the collections policies
-func (g *GossipService) DistributePrivateData(channelID string, txID string, privData *transientstore.TxPvtReadWriteSetWithConfigInfo, blkHt uint64) error {
+func (g *GossipService) DistributePrivateData(channelID string, txID string, privData *tspb.TxPvtReadWriteSetWithConfigInfo, blkHt uint64) error {
 	g.lock.RLock()
 	handler, exists := g.privateHandlers[channelID]
 	g.lock.RUnlock()
@@ -264,7 +298,8 @@ func (g *GossipService) DistributePrivateData(channelID string, txID string, pri
 	}
 
 	if err := handler.distributor.Distribute(txID, privData, blkHt); err != nil {
-		logger.Error("Failed to distributed private collection, txID", txID, "channel", channelID, "due to", err)
+		err := errors.WithMessagef(err, "failed to distribute private collection, txID %s, channel %s", txID, channelID)
+		logger.Error(err)
 		return err
 	}
 
@@ -286,58 +321,47 @@ func (g *GossipService) NewConfigEventer() ConfigProcessor {
 type Support struct {
 	Validator            txvalidator.Validator
 	Committer            committer.Committer
-	Store                gossipprivdata.TransientStore
 	CollectionStore      privdata.CollectionStore
 	IdDeserializeFactory gossipprivdata.IdentityDeserializerFactory
-}
-
-// DataStoreSupport aggregates interfaces capable
-// of handling either incoming blocks or private data
-type DataStoreSupport struct {
-	committer.Committer
-	gossipprivdata.TransientStore
+	CapabilityProvider   gossipprivdata.CapabilityProvider
 }
 
 // InitializeChannel allocates the state provider and should be invoked once per channel per execution
-func (g *GossipService) InitializeChannel(channelID string, endpoints []string, support Support) {
+func (g *GossipService) InitializeChannel(channelID string, ordererSource *orderers.ConnectionSource, store *transientstore.Store, support Support) {
 	g.lock.Lock()
 	defer g.lock.Unlock()
 	// Initialize new state provider for given committer
 	logger.Debug("Creating state provider for channelID", channelID)
 	servicesAdapter := &state.ServicesMediator{GossipAdapter: g, MCSAdapter: g.mcs}
 
-	// Embed transient store and committer APIs to fulfill
-	// DataStore interface to capture ability of retrieving
-	// private data
-	storeSupport := &DataStoreSupport{
-		TransientStore: support.Store,
-		Committer:      support.Committer,
-	}
 	// Initialize private data fetcher
-	dataRetriever := gossipprivdata.NewDataRetriever(storeSupport)
+	dataRetriever := gossipprivdata.NewDataRetriever(store, support.Committer)
 	collectionAccessFactory := gossipprivdata.NewCollectionAccessFactory(support.IdDeserializeFactory)
 	fetcher := gossipprivdata.NewPuller(g.metrics.PrivdataMetrics, support.CollectionStore, g.gossipSvc, dataRetriever,
 		collectionAccessFactory, channelID, g.serviceConfig.BtlPullMargin)
 
 	coordinatorConfig := gossipprivdata.CoordinatorConfig{
-		TransientBlockRetention: g.serviceConfig.TransientstoreMaxBlockRetention,
-		PullRetryThreshold:      g.serviceConfig.PvtDataPullRetryThreshold,
+		TransientBlockRetention:        g.serviceConfig.TransientstoreMaxBlockRetention,
+		PullRetryThreshold:             g.serviceConfig.PvtDataPullRetryThreshold,
+		SkipPullingInvalidTransactions: g.serviceConfig.SkipPullingInvalidTransactionsDuringCommit,
 	}
-	coordinator := gossipprivdata.NewCoordinator(gossipprivdata.Support{
-		ChainID:         channelID,
-		CollectionStore: support.CollectionStore,
-		Validator:       support.Validator,
-		TransientStore:  support.Store,
-		Committer:       support.Committer,
-		Fetcher:         fetcher,
-	}, g.createSelfSignedData(), g.metrics.PrivdataMetrics, coordinatorConfig)
+	selfSignedData := g.createSelfSignedData()
+	mspID := string(g.secAdv.OrgByPeerIdentity(selfSignedData.Identity))
+	coordinator := gossipprivdata.NewCoordinator(mspID, gossipprivdata.Support{
+		ChainID:            channelID,
+		CollectionStore:    support.CollectionStore,
+		Validator:          support.Validator,
+		Committer:          support.Committer,
+		Fetcher:            fetcher,
+		CapabilityProvider: support.CapabilityProvider,
+	}, store, selfSignedData, g.metrics.PrivdataMetrics, coordinatorConfig,
+		support.IdDeserializeFactory)
 
-	privdataConfig := gossipprivdata.GlobalConfig()
 	var reconciler gossipprivdata.PvtDataReconciler
 
-	if privdataConfig.ReconciliationEnabled {
+	if g.privdataConfig.ReconciliationEnabled {
 		reconciler = gossipprivdata.NewReconciler(channelID, g.metrics.PrivdataMetrics,
-			support.Committer, fetcher, privdataConfig)
+			support.Committer, fetcher, g.privdataConfig)
 	} else {
 		reconciler = &gossipprivdata.NoOpReconciler{}
 	}
@@ -354,6 +378,7 @@ func (g *GossipService) InitializeChannel(channelID string, endpoints []string, 
 	blockingMode := !g.serviceConfig.NonBlockingCommitMode
 	stateConfig := state.GlobalConfig()
 	g.chains[channelID] = state.NewGossipStateProvider(
+		flogging.MustGetLogger(util.StateLogger),
 		channelID,
 		servicesAdapter,
 		coordinator,
@@ -361,11 +386,7 @@ func (g *GossipService) InitializeChannel(channelID string, endpoints []string, 
 		blockingMode,
 		stateConfig)
 	if g.deliveryService[channelID] == nil {
-		var err error
-		g.deliveryService[channelID], err = g.deliveryFactory.Service(g, endpoints, g.mcs)
-		if err != nil {
-			logger.Warningf("Cannot create delivery client, due to %+v", errors.WithStack(err))
-		}
+		g.deliveryService[channelID] = g.deliveryFactory.Service(g, ordererSource, g.mcs, g.serviceConfig.OrgLeader)
 	}
 
 	// Delivery service might be nil only if it was not able to get connected
@@ -397,6 +418,7 @@ func (g *GossipService) InitializeChannel(channelID string, endpoints []string, 
 	} else {
 		logger.Warning("Delivery client is down won't be able to pull blocks for chain", channelID)
 	}
+
 }
 
 func (g *GossipService) createSelfSignedData() protoutil.SignedData {
@@ -416,11 +438,12 @@ func (g *GossipService) createSelfSignedData() protoutil.SignedData {
 func (g *GossipService) updateAnchors(config Config) {
 	myOrg := string(g.secAdv.OrgByPeerIdentity(api.PeerIdentityType(g.peerIdentity)))
 	if !g.amIinChannel(myOrg, config) {
-		logger.Error("Tried joining channel", config.ChainID(), "but our org(", myOrg, "), isn't "+
+		logger.Error("Tried joining channel", config.ChannelID(), "but our org(", myOrg, "), isn't "+
 			"among the orgs of the channel:", orgListFromConfig(config), ", aborting.")
 		return
 	}
 	jcm := &joinChannelMessage{seqNum: config.Sequence(), members2AnchorPeers: map[string][]api.AnchorPeer{}}
+	anchorPeerEndpoints := map[string]struct{}{}
 	for _, appOrg := range config.Organizations() {
 		logger.Debug(appOrg.MSPID(), "anchor peers:", appOrg.AnchorPeers())
 		jcm.members2AnchorPeers[appOrg.MSPID()] = []api.AnchorPeer{}
@@ -430,23 +453,14 @@ func (g *GossipService) updateAnchors(config Config) {
 				Port: int(ap.Port),
 			}
 			jcm.members2AnchorPeers[appOrg.MSPID()] = append(jcm.members2AnchorPeers[appOrg.MSPID()], anchorPeer)
+			anchorPeerEndpoints[fmt.Sprintf("%s:%d", ap.Host, ap.Port)] = struct{}{}
 		}
 	}
+	g.anchorPeerTracker.update(config.ChannelID(), anchorPeerEndpoints)
 
 	// Initialize new state provider for given committer
-	logger.Debug("Creating state provider for channelID", config.ChainID())
-	g.JoinChan(jcm, gossipcommon.ChannelID(config.ChainID()))
-}
-
-func (g *GossipService) updateEndpoints(channelID string, endpoints []string) {
-	if ds, ok := g.deliveryService[channelID]; ok {
-		logger.Debugf("Updating endpoints for channelID %s", channelID)
-		if err := ds.UpdateEndpoints(channelID, endpoints); err != nil {
-			// The only reason to fail is because of absence of block provider
-			// for given channel id, hence printing a warning will be enough
-			logger.Warningf("Failed to update ordering service endpoints, due to %s", err)
-		}
-	}
+	logger.Debug("Creating state provider for channelID", config.ChannelID())
+	g.JoinChan(jcm, gossipcommon.ChannelID(config.ChannelID()))
 }
 
 // AddPayload appends message payload to for given chain

@@ -9,58 +9,64 @@ package msgprocessor
 import (
 	"testing"
 
+	"github.com/hyperledger/fabric-protos-go/common"
+	"github.com/hyperledger/fabric-protos-go/orderer"
+	"github.com/hyperledger/fabric-protos-go/orderer/etcdraft"
+	"github.com/hyperledger/fabric/bccsp/sw"
 	"github.com/hyperledger/fabric/common/capabilities"
 	"github.com/hyperledger/fabric/common/channelconfig"
-	mockconfig "github.com/hyperledger/fabric/common/mocks/config"
-	"github.com/hyperledger/fabric/internal/configtxgen/configtxgentest"
+	"github.com/hyperledger/fabric/core/config/configtest"
 	"github.com/hyperledger/fabric/internal/configtxgen/encoder"
-	"github.com/hyperledger/fabric/internal/configtxgen/localconfig"
+	"github.com/hyperledger/fabric/internal/configtxgen/genesisconfig"
 	"github.com/hyperledger/fabric/internal/configtxlator/update"
-	"github.com/hyperledger/fabric/protos/common"
-	"github.com/hyperledger/fabric/protos/orderer"
-	"github.com/hyperledger/fabric/protos/orderer/etcdraft"
+	"github.com/hyperledger/fabric/orderer/common/msgprocessor/mocks"
 	"github.com/hyperledger/fabric/protoutil"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+func newMockOrdererConfig(migration bool, state orderer.ConsensusType_State) *mocks.OrdererConfig {
+	mockOrderer := &mocks.OrdererConfig{}
+	mockCapabilities := &mocks.OrdererCapabilities{}
+	mockCapabilities.ConsensusTypeMigrationReturns(migration)
+	mockOrderer.CapabilitiesReturns(mockCapabilities)
+	mockOrderer.ConsensusTypeReturns("kafka")
+	mockOrderer.ConsensusStateReturns(state)
+	return mockOrderer
+}
+
 func TestMaintenanceNoConfig(t *testing.T) {
 	ms := &mockSystemChannelFilterSupport{
-		OrdererConfigVal: &mockconfig.Orderer{
-			CapabilitiesVal:       &mockconfig.OrdererCapabilities{ConsensusTypeMigrationVal: true},
-			ConsensusTypeVal:      "solo",
-			ConsensusTypeStateVal: orderer.ConsensusType_STATE_NORMAL,
-		},
+		OrdererConfigVal: &mocks.OrdererConfig{},
 	}
-	mf := NewMaintenanceFilter(ms)
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+	mf := NewMaintenanceFilter(ms, cryptoProvider)
 	require.NotNil(t, mf)
 	ms.OrdererConfigVal = nil
-	assert.Panics(t, func() { _ = mf.Apply(&common.Envelope{}) }, "No orderer config")
+	require.Panics(t, func() { _ = mf.Apply(&common.Envelope{}) }, "No orderer config")
 }
 
 func TestMaintenanceDisabled(t *testing.T) {
 	msInactive := &mockSystemChannelFilterSupport{
-		OrdererConfigVal: &mockconfig.Orderer{
-			CapabilitiesVal:       &mockconfig.OrdererCapabilities{ConsensusTypeMigrationVal: false},
-			ConsensusTypeVal:      "kafka",
-			ConsensusTypeStateVal: orderer.ConsensusType_STATE_NORMAL,
-		},
+		OrdererConfigVal: newMockOrdererConfig(false, orderer.ConsensusType_STATE_NORMAL),
 	}
-	mf := NewMaintenanceFilter(msInactive)
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+	mf := NewMaintenanceFilter(msInactive, cryptoProvider)
 	require.NotNil(t, mf)
 	current := consensusTypeInfo{ordererType: "kafka", metadata: []byte{}, state: orderer.ConsensusType_STATE_NORMAL}
 
 	t.Run("Good", func(t *testing.T) {
 		configTx := makeConfigEnvelopeWithExtraStuff(t, current, current, 3)
 		err := mf.Apply(configTx)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 
 	t.Run("Block entry to maintenance", func(t *testing.T) {
 		next := consensusTypeInfo{ordererType: "kafka", metadata: []byte{}, state: orderer.ConsensusType_STATE_MAINTENANCE}
 		configTx := makeConfigEnvelope(t, current, next)
 		err := mf.Apply(configTx)
-		assert.EqualError(t, err,
+		require.EqualError(t, err,
 			"config transaction inspection failed: next config attempted to change ConsensusType.State to STATE_MAINTENANCE, but capability is disabled")
 	})
 
@@ -68,20 +74,18 @@ func TestMaintenanceDisabled(t *testing.T) {
 		next := consensusTypeInfo{ordererType: "solo", metadata: []byte{}, state: orderer.ConsensusType_STATE_NORMAL}
 		configTx := makeConfigEnvelope(t, current, next)
 		err := mf.Apply(configTx)
-		assert.EqualError(t, err,
+		require.EqualError(t, err,
 			"config transaction inspection failed: next config attempted to change ConsensusType.Type from kafka to solo, but capability is disabled")
 	})
 }
 
-func TestMaintenanceParseEvelope(t *testing.T) {
+func TestMaintenanceParseEnvelope(t *testing.T) {
 	msActive := &mockSystemChannelFilterSupport{
-		OrdererConfigVal: &mockconfig.Orderer{
-			CapabilitiesVal:       &mockconfig.OrdererCapabilities{ConsensusTypeMigrationVal: true},
-			ConsensusTypeVal:      "kafka",
-			ConsensusTypeStateVal: orderer.ConsensusType_STATE_NORMAL,
-		},
+		OrdererConfigVal: newMockOrdererConfig(true, orderer.ConsensusType_STATE_NORMAL),
 	}
-	mf := NewMaintenanceFilter(msActive)
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+	mf := NewMaintenanceFilter(msActive, cryptoProvider)
 	require.NotNil(t, mf)
 	badBytes := []byte{1, 2, 3, 4}
 
@@ -148,20 +152,18 @@ func TestMaintenanceParseEvelope(t *testing.T) {
 		t.Run(tCase.name, func(t *testing.T) {
 			err := mf.Apply(tCase.envelope)
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), tCase.errMsg)
+			require.Contains(t, err.Error(), tCase.errMsg)
 		})
 	}
 }
 
 func TestMaintenanceInspectEntry(t *testing.T) {
 	msActive := &mockSystemChannelFilterSupport{
-		OrdererConfigVal: &mockconfig.Orderer{
-			CapabilitiesVal:       &mockconfig.OrdererCapabilities{ConsensusTypeMigrationVal: true},
-			ConsensusTypeVal:      "kafka",
-			ConsensusTypeStateVal: orderer.ConsensusType_STATE_NORMAL,
-		},
+		OrdererConfigVal: newMockOrdererConfig(true, orderer.ConsensusType_STATE_NORMAL),
 	}
-	mf := NewMaintenanceFilter(msActive)
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+	mf := NewMaintenanceFilter(msActive, cryptoProvider)
 	require.NotNil(t, mf)
 	bogusMetadata := []byte{1, 2, 3, 4}
 	current := consensusTypeInfo{ordererType: "kafka", metadata: []byte{}, state: orderer.ConsensusType_STATE_NORMAL}
@@ -170,14 +172,14 @@ func TestMaintenanceInspectEntry(t *testing.T) {
 		next := consensusTypeInfo{ordererType: "kafka", metadata: []byte{}, state: orderer.ConsensusType_STATE_MAINTENANCE}
 		configTx := makeConfigEnvelope(t, current, next)
 		err := mf.Apply(configTx)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 
 	t.Run("Bad: concurrent change to consensus type & state", func(t *testing.T) {
 		next := consensusTypeInfo{ordererType: "etcdraft", metadata: bogusMetadata, state: orderer.ConsensusType_STATE_MAINTENANCE}
 		configTx := makeConfigEnvelope(t, current, next)
 		err := mf.Apply(configTx)
-		assert.EqualError(t, err,
+		require.EqualError(t, err,
 			"config transaction inspection failed: attempted to change ConsensusType.Type from kafka to etcdraft, but ConsensusType.State is changing from STATE_NORMAL to STATE_MAINTENANCE")
 	})
 
@@ -185,20 +187,18 @@ func TestMaintenanceInspectEntry(t *testing.T) {
 		next := consensusTypeInfo{ordererType: "etcdraft", metadata: bogusMetadata, state: orderer.ConsensusType_STATE_NORMAL}
 		configTx := makeConfigEnvelope(t, current, next)
 		err := mf.Apply(configTx)
-		assert.EqualError(t, err,
+		require.EqualError(t, err,
 			"config transaction inspection failed: attempted to change consensus type from kafka to etcdraft, but current config ConsensusType.State is not in maintenance mode")
 	})
 }
 
 func TestMaintenanceInspectChange(t *testing.T) {
 	msActive := &mockSystemChannelFilterSupport{
-		OrdererConfigVal: &mockconfig.Orderer{
-			CapabilitiesVal:       &mockconfig.OrdererCapabilities{ConsensusTypeMigrationVal: true},
-			ConsensusTypeVal:      "kafka",
-			ConsensusTypeStateVal: orderer.ConsensusType_STATE_MAINTENANCE,
-		},
+		OrdererConfigVal: newMockOrdererConfig(true, orderer.ConsensusType_STATE_MAINTENANCE),
 	}
-	mf := NewMaintenanceFilter(msActive)
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+	mf := NewMaintenanceFilter(msActive, cryptoProvider)
 	require.NotNil(t, mf)
 	bogusMetadata := []byte{1, 2, 3, 4}
 	validMetadata := protoutil.MarshalOrPanic(&etcdraft.ConfigMetadata{})
@@ -208,21 +208,21 @@ func TestMaintenanceInspectChange(t *testing.T) {
 		next := consensusTypeInfo{ordererType: "etcdraft", metadata: validMetadata, state: orderer.ConsensusType_STATE_MAINTENANCE}
 		configTx := makeConfigEnvelope(t, current, next)
 		err := mf.Apply(configTx)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 
 	t.Run("Good exit, no change", func(t *testing.T) {
 		next := consensusTypeInfo{ordererType: "kafka", metadata: []byte{}, state: orderer.ConsensusType_STATE_NORMAL}
 		configTx := makeConfigEnvelope(t, current, next)
 		err := mf.Apply(configTx)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 
 	t.Run("Bad: unsupported consensus type", func(t *testing.T) {
 		next := consensusTypeInfo{ordererType: "unsupported", metadata: bogusMetadata, state: orderer.ConsensusType_STATE_MAINTENANCE}
 		configTx := makeConfigEnvelope(t, current, next)
 		err := mf.Apply(configTx)
-		assert.EqualError(t, err,
+		require.EqualError(t, err,
 			"config transaction inspection failed: attempted to change consensus type from kafka to unsupported, transition not supported")
 	})
 
@@ -230,7 +230,7 @@ func TestMaintenanceInspectChange(t *testing.T) {
 		next := consensusTypeInfo{ordererType: "etcdraft", metadata: validMetadata, state: orderer.ConsensusType_STATE_NORMAL}
 		configTx := makeConfigEnvelope(t, current, next)
 		err := mf.Apply(configTx)
-		assert.EqualError(t, err,
+		require.EqualError(t, err,
 			"config transaction inspection failed: attempted to change ConsensusType.Type from kafka to etcdraft, but ConsensusType.State is changing from STATE_MAINTENANCE to STATE_NORMAL")
 	})
 
@@ -239,22 +239,23 @@ func TestMaintenanceInspectChange(t *testing.T) {
 		configTx := makeConfigEnvelope(t, current, next)
 		err := mf.Apply(configTx)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(),
+		require.Contains(t, err.Error(),
 			"config transaction inspection failed: failed to unmarshal etcdraft metadata configuration")
 	})
 }
 
 func TestMaintenanceInspectExit(t *testing.T) {
 	validMetadata := protoutil.MarshalOrPanic(&etcdraft.ConfigMetadata{})
+	mockOrderer := newMockOrdererConfig(true, orderer.ConsensusType_STATE_MAINTENANCE)
+	mockOrderer.ConsensusTypeReturns("etcdraft")
+	mockOrderer.ConsensusMetadataReturns(validMetadata)
+
 	msActive := &mockSystemChannelFilterSupport{
-		OrdererConfigVal: &mockconfig.Orderer{
-			CapabilitiesVal:       &mockconfig.OrdererCapabilities{ConsensusTypeMigrationVal: true},
-			ConsensusTypeVal:      "etcdraft",
-			ConsensusTypeStateVal: orderer.ConsensusType_STATE_MAINTENANCE,
-			ConsensusMetadataVal:  validMetadata,
-		},
+		OrdererConfigVal: mockOrderer,
 	}
-	mf := NewMaintenanceFilter(msActive)
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+	mf := NewMaintenanceFilter(msActive, cryptoProvider)
 	require.NotNil(t, mf)
 	current := consensusTypeInfo{ordererType: "etcdraft", metadata: validMetadata, state: orderer.ConsensusType_STATE_MAINTENANCE}
 
@@ -262,14 +263,14 @@ func TestMaintenanceInspectExit(t *testing.T) {
 		next := consensusTypeInfo{ordererType: "etcdraft", metadata: validMetadata, state: orderer.ConsensusType_STATE_NORMAL}
 		configTx := makeConfigEnvelope(t, current, next)
 		err := mf.Apply(configTx)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 
 	t.Run("Bad: concurrent change to consensus type & state", func(t *testing.T) {
 		next := consensusTypeInfo{ordererType: "kafka", metadata: []byte{}, state: orderer.ConsensusType_STATE_NORMAL}
 		configTx := makeConfigEnvelope(t, current, next)
 		err := mf.Apply(configTx)
-		assert.EqualError(t, err,
+		require.EqualError(t, err,
 			"config transaction inspection failed: attempted to change ConsensusType.Type from etcdraft to kafka, but ConsensusType.State is changing from STATE_MAINTENANCE to STATE_NORMAL")
 	})
 
@@ -277,33 +278,31 @@ func TestMaintenanceInspectExit(t *testing.T) {
 		next := consensusTypeInfo{ordererType: "etcdraft", metadata: validMetadata, state: orderer.ConsensusType_STATE_NORMAL}
 		configTx := makeConfigEnvelopeWithExtraStuff(t, current, next, 1)
 		err := mf.Apply(configTx)
-		assert.EqualError(t, err, "config transaction inspection failed: config update contains changes to more than one group")
+		require.EqualError(t, err, "config transaction inspection failed: config update contains changes to more than one group")
 	})
 
 	t.Run("Bad: exit with extra value", func(t *testing.T) {
 		next := consensusTypeInfo{ordererType: "etcdraft", metadata: validMetadata, state: orderer.ConsensusType_STATE_NORMAL}
 		configTx := makeConfigEnvelopeWithExtraStuff(t, current, next, 2)
 		err := mf.Apply(configTx)
-		assert.EqualError(t, err, "config transaction inspection failed: config update contains changes to values in group Channel")
+		require.EqualError(t, err, "config transaction inspection failed: config update contains changes to values in group Channel")
 	})
 
 	t.Run("Bad: exit with extra orderer value", func(t *testing.T) {
 		next := consensusTypeInfo{ordererType: "etcdraft", metadata: validMetadata, state: orderer.ConsensusType_STATE_NORMAL}
 		configTx := makeConfigEnvelopeWithExtraStuff(t, current, next, 3)
 		err := mf.Apply(configTx)
-		assert.EqualError(t, err, "config transaction inspection failed: config update contain more then just the ConsensusType value in the Orderer group")
+		require.EqualError(t, err, "config transaction inspection failed: config update contain more then just the ConsensusType value in the Orderer group")
 	})
 }
 
 func TestMaintenanceExtra(t *testing.T) {
 	msActive := &mockSystemChannelFilterSupport{
-		OrdererConfigVal: &mockconfig.Orderer{
-			CapabilitiesVal:       &mockconfig.OrdererCapabilities{ConsensusTypeMigrationVal: true},
-			ConsensusTypeVal:      "kafka",
-			ConsensusTypeStateVal: orderer.ConsensusType_STATE_MAINTENANCE,
-		},
+		OrdererConfigVal: newMockOrdererConfig(true, orderer.ConsensusType_STATE_MAINTENANCE),
 	}
-	mf := NewMaintenanceFilter(msActive)
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+	mf := NewMaintenanceFilter(msActive, cryptoProvider)
 	require.NotNil(t, mf)
 	current := consensusTypeInfo{ordererType: "kafka", metadata: nil, state: orderer.ConsensusType_STATE_MAINTENANCE}
 	validMetadata := protoutil.MarshalOrPanic(&etcdraft.ConfigMetadata{})
@@ -312,39 +311,37 @@ func TestMaintenanceExtra(t *testing.T) {
 		next := consensusTypeInfo{ordererType: "etcdraft", metadata: validMetadata, state: orderer.ConsensusType_STATE_MAINTENANCE}
 		configTx := makeConfigEnvelopeWithExtraStuff(t, current, next, 1)
 		err := mf.Apply(configTx)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 
 	t.Run("Good: with extra value", func(t *testing.T) {
 		next := consensusTypeInfo{ordererType: "etcdraft", metadata: validMetadata, state: orderer.ConsensusType_STATE_MAINTENANCE}
 		configTx := makeConfigEnvelopeWithExtraStuff(t, current, next, 2)
 		err := mf.Apply(configTx)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 
 	t.Run("Good: with extra orderer value", func(t *testing.T) {
 		next := consensusTypeInfo{ordererType: "etcdraft", metadata: validMetadata, state: orderer.ConsensusType_STATE_MAINTENANCE}
 		configTx := makeConfigEnvelopeWithExtraStuff(t, current, next, 3)
 		err := mf.Apply(configTx)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 }
 
 func TestMaintenanceMissingConsensusType(t *testing.T) {
 	msActive := &mockSystemChannelFilterSupport{
-		OrdererConfigVal: &mockconfig.Orderer{
-			CapabilitiesVal:       &mockconfig.OrdererCapabilities{ConsensusTypeMigrationVal: true},
-			ConsensusTypeVal:      "kafka",
-			ConsensusTypeStateVal: orderer.ConsensusType_STATE_MAINTENANCE,
-		},
+		OrdererConfigVal: newMockOrdererConfig(true, orderer.ConsensusType_STATE_MAINTENANCE),
 	}
-	mf := NewMaintenanceFilter(msActive)
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+	mf := NewMaintenanceFilter(msActive, cryptoProvider)
 	require.NotNil(t, mf)
 	current := consensusTypeInfo{ordererType: "kafka", metadata: nil, state: orderer.ConsensusType_STATE_MAINTENANCE}
 	for i := 1; i < 4; i++ {
 		configTx := makeConfigEnvelopeWithExtraStuff(t, current, current, i)
 		err := mf.Apply(configTx)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	}
 }
 
@@ -458,7 +455,7 @@ func makeConfigTx(original, updated *common.Config, t *testing.T) *common.Envelo
 }
 
 func makeBaseConfig(t *testing.T) *common.Config {
-	gConf := configtxgentest.Load(localconfig.SampleInsecureSoloProfile)
+	gConf := genesisconfig.Load(genesisconfig.SampleInsecureSoloProfile, configtest.GetDevConfigDir())
 	gConf.Orderer.Capabilities = map[string]bool{
 		capabilities.OrdererV1_4_2: true,
 	}

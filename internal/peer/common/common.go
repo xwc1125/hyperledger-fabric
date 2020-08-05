@@ -12,22 +12,21 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"runtime"
 	"strings"
 	"time"
 
+	pcommon "github.com/hyperledger/fabric-protos-go/common"
+	pb "github.com/hyperledger/fabric-protos-go/peer"
+	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/bccsp/factory"
 	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/flogging"
-	"github.com/hyperledger/fabric/core/comm"
 	"github.com/hyperledger/fabric/core/config"
 	"github.com/hyperledger/fabric/core/scc/cscc"
+	"github.com/hyperledger/fabric/internal/pkg/comm"
 	"github.com/hyperledger/fabric/msp"
 	mspmgmt "github.com/hyperledger/fabric/msp/mgmt"
-	pcommon "github.com/hyperledger/fabric/protos/common"
-	pb "github.com/hyperledger/fabric/protos/peer"
 	"github.com/hyperledger/fabric/protoutil"
-	"github.com/mitchellh/mapstructure"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -71,7 +70,7 @@ var (
 	// GetOrdererEndpointOfChainFnc returns orderer endpoints of given chain
 	// by default it is set to GetOrdererEndpointOfChain function
 	GetOrdererEndpointOfChainFnc func(chainID string, signer Signer,
-		endorserClient pb.EndorserClient) ([]string, error)
+		endorserClient pb.EndorserClient, cryptoProvider bccsp.BCCSP) ([]string, error)
 
 	// GetCertificateFnc is a function that returns the client TLS certificate
 	GetCertificateFnc func() (tls.Certificate, error)
@@ -95,7 +94,6 @@ func init() {
 
 // InitConfig initializes viper config
 func InitConfig(cmdRoot string) error {
-
 	err := config.InitViper(nil, cmdRoot)
 	if err != nil {
 		return err
@@ -121,9 +119,10 @@ func InitConfig(cmdRoot string) error {
 func InitCrypto(mspMgrConfigDir, localMSPID, localMSPType string) error {
 	// Check whether msp folder exists
 	fi, err := os.Stat(mspMgrConfigDir)
-	if os.IsNotExist(err) || !fi.IsDir() {
-		// No need to try to load MSP from folder which is not available
-		return errors.Errorf("cannot init crypto, folder \"%s\" does not exist", mspMgrConfigDir)
+	if err != nil {
+		return errors.Errorf("cannot init crypto, specified path \"%s\" does not exist or cannot be accessed: %v", mspMgrConfigDir, err)
+	} else if !fi.IsDir() {
+		return errors.Errorf("cannot init crypto, specified path \"%s\" is not a directory", mspMgrConfigDir)
 	}
 	// Check whether localMSPID exists
 	if localMSPID == "" {
@@ -133,11 +132,8 @@ func InitCrypto(mspMgrConfigDir, localMSPID, localMSPType string) error {
 	// Init the BCCSP
 	SetBCCSPKeystorePath()
 	bccspConfig := factory.GetDefaultOpts()
-	if config := viper.Get("peer.BCCSP"); config != nil {
-		err = mapstructure.Decode(config, bccspConfig)
-		if err != nil {
-			return errors.WithMessage(err, "could not decode peer BCCSP configuration")
-		}
+	if err := viper.UnmarshalKey("peer.BCCSP", &bccspConfig); err != nil {
+		return errors.WithMessage(err, "could not decode peer BCCSP configuration")
 	}
 
 	err = mspmgmt.LoadLocalMspWithType(mspMgrConfigDir, bccspConfig, localMSPID, localMSPType)
@@ -149,15 +145,17 @@ func InitCrypto(mspMgrConfigDir, localMSPID, localMSPType string) error {
 }
 
 // SetBCCSPKeystorePath sets the file keystore path for the SW BCCSP provider
-// to an absolute path relative to the config file
+// to an absolute path relative to the config file.
 func SetBCCSPKeystorePath() {
-	viper.Set("peer.BCCSP.SW.FileKeyStore.KeyStore",
-		config.GetPath("peer.BCCSP.SW.FileKeyStore.KeyStore"))
+	key := "peer.BCCSP.SW.FileKeyStore.KeyStore"
+	if ksPath := config.GetPath(key); ksPath != "" {
+		viper.Set(key, ksPath)
+	}
 }
 
-// GetDefaultSigner return a default Signer(Default/PERR) for cli
+// GetDefaultSigner return a default Signer(Default/PEER) for cli
 func GetDefaultSigner() (msp.SigningIdentity, error) {
-	signer, err := mspmgmt.GetLocalMSP().GetDefaultSigningIdentity()
+	signer, err := mspmgmt.GetLocalMSP(factory.GetDefault()).GetDefaultSigningIdentity()
 	if err != nil {
 		return nil, errors.WithMessage(err, "error obtaining the default signing identity")
 	}
@@ -172,7 +170,7 @@ type Signer interface {
 }
 
 // GetOrdererEndpointOfChain returns orderer endpoints of given chain
-func GetOrdererEndpointOfChain(chainID string, signer Signer, endorserClient pb.EndorserClient) ([]string, error) {
+func GetOrdererEndpointOfChain(chainID string, signer Signer, endorserClient pb.EndorserClient, cryptoProvider bccsp.BCCSP) ([]string, error) {
 	// query cscc for chain config block
 	invocation := &pb.ChaincodeInvocationSpec{
 		ChaincodeSpec: &pb.ChaincodeSpec{
@@ -211,7 +209,7 @@ func GetOrdererEndpointOfChain(chainID string, signer Signer, endorserClient pb.
 	}
 
 	// parse config block
-	block, err := protoutil.GetBlockFromBlockBytes(proposalResp.Response.Payload)
+	block, err := protoutil.UnmarshalBlock(proposalResp.Response.Payload)
 	if err != nil {
 		return nil, errors.WithMessage(err, "error unmarshaling config block")
 	}
@@ -220,7 +218,7 @@ func GetOrdererEndpointOfChain(chainID string, signer Signer, endorserClient pb.
 	if err != nil {
 		return nil, errors.WithMessage(err, "error extracting config block envelope")
 	}
-	bundle, err := channelconfig.NewBundleFromEnvelope(envelopeConfig)
+	bundle, err := channelconfig.NewBundleFromEnvelope(envelopeConfig, cryptoProvider)
 	if err != nil {
 		return nil, errors.WithMessage(err, "error loading config block")
 	}
@@ -245,7 +243,7 @@ func configFromEnv(prefix string) (address, override string, clientConfig comm.C
 		connTimeout = defaultConnTimeout
 	}
 	clientConfig.Timeout = connTimeout
-	secOpts := &comm.SecureOptions{
+	secOpts := comm.SecureOptions{
 		UseTLS:            viper.GetBool(prefix + ".tls.enabled"),
 		RequireClientCert: viper.GetBool(prefix + ".tls.clientAuthRequired")}
 	if secOpts.UseTLS {
@@ -305,6 +303,12 @@ func InitCmd(cmd *cobra.Command, args []string) {
 		LogSpec: loggingSpec,
 	})
 
+	// chaincode packaging does not require material from the local MSP
+	if cmd.CommandPath() == "peer lifecycle chaincode package" {
+		mainLogger.Debug("peer lifecycle chaincode package does not need to init crypto")
+		return
+	}
+
 	// Init the MSP
 	var mspMgrConfigDir = config.GetPath("peer.mspConfigPath")
 	var mspID = viper.GetString("peer.localMspId")
@@ -317,6 +321,4 @@ func InitCmd(cmd *cobra.Command, args []string) {
 		mainLogger.Errorf("Cannot run peer because %s", err.Error())
 		os.Exit(1)
 	}
-
-	runtime.GOMAXPROCS(viper.GetInt("peer.gomaxprocs"))
 }

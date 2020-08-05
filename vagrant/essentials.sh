@@ -9,7 +9,7 @@ export DEBIAN_FRONTEND=noninteractive
 # ----------------------------------------------------------------
 # Update the entire system to the latest versions
 # ----------------------------------------------------------------
-apt-get -qq update && apt-get upgrade -y
+apt-get clean && apt-get -qq update && apt-get upgrade -y
 
 # ----------------------------------------------------------------
 # Install some basic utilities
@@ -21,6 +21,6 @@ apt-get install -y \
     curl \
     g++ \
     git \
-    libtool \
+    jq \
     make \
     unzip

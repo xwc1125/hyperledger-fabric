@@ -14,7 +14,7 @@ import (
 	"github.com/hyperledger/fabric/internal/cryptogen/ca"
 	"github.com/hyperledger/fabric/internal/cryptogen/msp"
 	fabricmsp "github.com/hyperledger/fabric/msp"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
 )
 
@@ -32,12 +32,11 @@ const (
 
 var testDir = filepath.Join(os.TempDir(), "msp-test")
 
-func TestGenerateLocalMSP(t *testing.T) {
-
+func testGenerateLocalMSP(t *testing.T, nodeOUs bool) {
 	cleanup(testDir)
 
-	err := msp.GenerateLocalMSP(testDir, testName, nil, &ca.CA{}, &ca.CA{}, msp.PEER, true)
-	assert.Error(t, err, "Empty CA should have failed")
+	err := msp.GenerateLocalMSP(testDir, testName, nil, &ca.CA{}, &ca.CA{}, msp.PEER, nodeOUs)
+	require.Error(t, err, "Empty CA should have failed")
 
 	caDir := filepath.Join(testDir, "ca")
 	tlsCADir := filepath.Join(testDir, "tlsca")
@@ -46,37 +45,41 @@ func TestGenerateLocalMSP(t *testing.T) {
 
 	// generate signing CA
 	signCA, err := ca.NewCA(caDir, testCAOrg, testCAName, testCountry, testProvince, testLocality, testOrganizationalUnit, testStreetAddress, testPostalCode)
-	assert.NoError(t, err, "Error generating CA")
+	require.NoError(t, err, "Error generating CA")
 	// generate TLS CA
 	tlsCA, err := ca.NewCA(tlsCADir, testCAOrg, testCAName, testCountry, testProvince, testLocality, testOrganizationalUnit, testStreetAddress, testPostalCode)
-	assert.NoError(t, err, "Error generating CA")
+	require.NoError(t, err, "Error generating CA")
 
-	assert.NotEmpty(t, signCA.SignCert.Subject.Country, "country cannot be empty.")
-	assert.Equal(t, testCountry, signCA.SignCert.Subject.Country[0], "Failed to match country")
-	assert.NotEmpty(t, signCA.SignCert.Subject.Province, "province cannot be empty.")
-	assert.Equal(t, testProvince, signCA.SignCert.Subject.Province[0], "Failed to match province")
-	assert.NotEmpty(t, signCA.SignCert.Subject.Locality, "locality cannot be empty.")
-	assert.Equal(t, testLocality, signCA.SignCert.Subject.Locality[0], "Failed to match locality")
-	assert.NotEmpty(t, signCA.SignCert.Subject.OrganizationalUnit, "organizationalUnit cannot be empty.")
-	assert.Equal(t, testOrganizationalUnit, signCA.SignCert.Subject.OrganizationalUnit[0], "Failed to match organizationalUnit")
-	assert.NotEmpty(t, signCA.SignCert.Subject.StreetAddress, "streetAddress cannot be empty.")
-	assert.Equal(t, testStreetAddress, signCA.SignCert.Subject.StreetAddress[0], "Failed to match streetAddress")
-	assert.NotEmpty(t, signCA.SignCert.Subject.PostalCode, "postalCode cannot be empty.")
-	assert.Equal(t, testPostalCode, signCA.SignCert.Subject.PostalCode[0], "Failed to match postalCode")
+	require.NotEmpty(t, signCA.SignCert.Subject.Country, "country cannot be empty.")
+	require.Equal(t, testCountry, signCA.SignCert.Subject.Country[0], "Failed to match country")
+	require.NotEmpty(t, signCA.SignCert.Subject.Province, "province cannot be empty.")
+	require.Equal(t, testProvince, signCA.SignCert.Subject.Province[0], "Failed to match province")
+	require.NotEmpty(t, signCA.SignCert.Subject.Locality, "locality cannot be empty.")
+	require.Equal(t, testLocality, signCA.SignCert.Subject.Locality[0], "Failed to match locality")
+	require.NotEmpty(t, signCA.SignCert.Subject.OrganizationalUnit, "organizationalUnit cannot be empty.")
+	require.Equal(t, testOrganizationalUnit, signCA.SignCert.Subject.OrganizationalUnit[0], "Failed to match organizationalUnit")
+	require.NotEmpty(t, signCA.SignCert.Subject.StreetAddress, "streetAddress cannot be empty.")
+	require.Equal(t, testStreetAddress, signCA.SignCert.Subject.StreetAddress[0], "Failed to match streetAddress")
+	require.NotEmpty(t, signCA.SignCert.Subject.PostalCode, "postalCode cannot be empty.")
+	require.Equal(t, testPostalCode, signCA.SignCert.Subject.PostalCode[0], "Failed to match postalCode")
 
 	// generate local MSP for nodeType=PEER
-	err = msp.GenerateLocalMSP(testDir, testName, nil, signCA, tlsCA, msp.PEER, true)
-	assert.NoError(t, err, "Failed to generate local MSP")
+	err = msp.GenerateLocalMSP(testDir, testName, nil, signCA, tlsCA, msp.PEER, nodeOUs)
+	require.NoError(t, err, "Failed to generate local MSP")
 
 	// check to see that the right files were generated/saved
 	mspFiles := []string{
-		filepath.Join(mspDir, "admincerts", testName+"-cert.pem"),
 		filepath.Join(mspDir, "cacerts", testCAName+"-cert.pem"),
 		filepath.Join(mspDir, "tlscacerts", testCAName+"-cert.pem"),
 		filepath.Join(mspDir, "keystore"),
 		filepath.Join(mspDir, "signcerts", testName+"-cert.pem"),
-		filepath.Join(mspDir, "config.yaml"),
 	}
+	if nodeOUs {
+		mspFiles = append(mspFiles, filepath.Join(mspDir, "config.yaml"))
+	} else {
+		mspFiles = append(mspFiles, filepath.Join(mspDir, "admincerts", testName+"-cert.pem"))
+	}
+
 	tlsFiles := []string{
 		filepath.Join(tlsDir, "ca.crt"),
 		filepath.Join(tlsDir, "server.key"),
@@ -84,76 +87,94 @@ func TestGenerateLocalMSP(t *testing.T) {
 	}
 
 	for _, file := range mspFiles {
-		assert.Equal(t, true, checkForFile(file),
+		require.Equal(t, true, checkForFile(file),
 			"Expected to find file "+file)
 	}
 	for _, file := range tlsFiles {
-		assert.Equal(t, true, checkForFile(file),
+		require.Equal(t, true, checkForFile(file),
 			"Expected to find file "+file)
 	}
 
 	// generate local MSP for nodeType=CLIENT
-	err = msp.GenerateLocalMSP(testDir, testName, nil, signCA, tlsCA, msp.CLIENT, true)
-	assert.NoError(t, err, "Failed to generate local MSP")
-	//only need to check for the TLS certs
-	tlsFiles = []string{
-		filepath.Join(tlsDir, "ca.crt"),
-		filepath.Join(tlsDir, "client.key"),
-		filepath.Join(tlsDir, "client.crt"),
+	err = msp.GenerateLocalMSP(testDir, testName, nil, signCA, tlsCA, msp.CLIENT, nodeOUs)
+	require.NoError(t, err, "Failed to generate local MSP")
+	// check all
+	for _, file := range mspFiles {
+		require.Equal(t, true, checkForFile(file),
+			"Expected to find file "+file)
 	}
 
 	for _, file := range tlsFiles {
-		assert.Equal(t, true, checkForFile(file),
+		require.Equal(t, true, checkForFile(file),
 			"Expected to find file "+file)
 	}
 
 	tlsCA.Name = "test/fail"
-	err = msp.GenerateLocalMSP(testDir, testName, nil, signCA, tlsCA, msp.CLIENT, true)
-	assert.Error(t, err, "Should have failed with CA name 'test/fail'")
+	err = msp.GenerateLocalMSP(testDir, testName, nil, signCA, tlsCA, msp.CLIENT, nodeOUs)
+	require.Error(t, err, "Should have failed with CA name 'test/fail'")
 	signCA.Name = "test/fail"
-	err = msp.GenerateLocalMSP(testDir, testName, nil, signCA, tlsCA, msp.ORDERER, true)
-	assert.Error(t, err, "Should have failed with CA name 'test/fail'")
+	err = msp.GenerateLocalMSP(testDir, testName, nil, signCA, tlsCA, msp.ORDERER, nodeOUs)
+	require.Error(t, err, "Should have failed with CA name 'test/fail'")
 	t.Log(err)
 	cleanup(testDir)
-
 }
 
-func TestGenerateVerifyingMSP(t *testing.T) {
+func TestGenerateLocalMSPWithNodeOU(t *testing.T) {
+	testGenerateLocalMSP(t, true)
+}
 
+func TestGenerateLocalMSPWithoutNodeOU(t *testing.T) {
+	testGenerateLocalMSP(t, false)
+}
+
+func testGenerateVerifyingMSP(t *testing.T, nodeOUs bool) {
 	caDir := filepath.Join(testDir, "ca")
 	tlsCADir := filepath.Join(testDir, "tlsca")
 	mspDir := filepath.Join(testDir, "msp")
 	// generate signing CA
 	signCA, err := ca.NewCA(caDir, testCAOrg, testCAName, testCountry, testProvince, testLocality, testOrganizationalUnit, testStreetAddress, testPostalCode)
-	assert.NoError(t, err, "Error generating CA")
+	require.NoError(t, err, "Error generating CA")
 	// generate TLS CA
 	tlsCA, err := ca.NewCA(tlsCADir, testCAOrg, testCAName, testCountry, testProvince, testLocality, testOrganizationalUnit, testStreetAddress, testPostalCode)
-	assert.NoError(t, err, "Error generating CA")
+	require.NoError(t, err, "Error generating CA")
 
-	err = msp.GenerateVerifyingMSP(mspDir, signCA, tlsCA, true)
-	assert.NoError(t, err, "Failed to generate verifying MSP")
+	err = msp.GenerateVerifyingMSP(mspDir, signCA, tlsCA, nodeOUs)
+	require.NoError(t, err, "Failed to generate verifying MSP")
 
 	// check to see that the right files were generated/saved
 	files := []string{
-		filepath.Join(mspDir, "admincerts", testCAName+"-cert.pem"),
 		filepath.Join(mspDir, "cacerts", testCAName+"-cert.pem"),
 		filepath.Join(mspDir, "tlscacerts", testCAName+"-cert.pem"),
-		filepath.Join(mspDir, "config.yaml"),
+	}
+
+	if nodeOUs {
+		files = append(files, filepath.Join(mspDir, "config.yaml"))
+	} else {
+		files = append(files, filepath.Join(mspDir, "admincerts", testCAName+"-cert.pem"))
 	}
 
 	for _, file := range files {
-		assert.Equal(t, true, checkForFile(file),
+		require.Equal(t, true, checkForFile(file),
 			"Expected to find file "+file)
 	}
 
 	tlsCA.Name = "test/fail"
-	err = msp.GenerateVerifyingMSP(mspDir, signCA, tlsCA, true)
-	assert.Error(t, err, "Should have failed with CA name 'test/fail'")
+	err = msp.GenerateVerifyingMSP(mspDir, signCA, tlsCA, nodeOUs)
+	require.Error(t, err, "Should have failed with CA name 'test/fail'")
 	signCA.Name = "test/fail"
-	err = msp.GenerateVerifyingMSP(mspDir, signCA, tlsCA, true)
-	assert.Error(t, err, "Should have failed with CA name 'test/fail'")
+	err = msp.GenerateVerifyingMSP(mspDir, signCA, tlsCA, nodeOUs)
+	require.Error(t, err, "Should have failed with CA name 'test/fail'")
 	t.Log(err)
 	cleanup(testDir)
+
+}
+
+func TestGenerateVerifyingMSPWithNodeOU(t *testing.T) {
+	testGenerateVerifyingMSP(t, true)
+}
+
+func TestGenerateVerifyingMSPWithoutNodeOU(t *testing.T) {
+	testGenerateVerifyingMSP(t, true)
 }
 
 func TestExportConfig(t *testing.T) {
@@ -167,7 +188,7 @@ func TestExportConfig(t *testing.T) {
 	}
 
 	err = msp.ExportConfig(path, caFile, true)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	configBytes, err := ioutil.ReadFile(configFile)
 	if err != nil {
@@ -179,11 +200,15 @@ func TestExportConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to unmarshal config: [%s]", err)
 	}
-	assert.True(t, config.NodeOUs.Enable)
-	assert.Equal(t, caFile, config.NodeOUs.ClientOUIdentifier.Certificate)
-	assert.Equal(t, msp.CLIENTOU, config.NodeOUs.ClientOUIdentifier.OrganizationalUnitIdentifier)
-	assert.Equal(t, caFile, config.NodeOUs.PeerOUIdentifier.Certificate)
-	assert.Equal(t, msp.PEEROU, config.NodeOUs.PeerOUIdentifier.OrganizationalUnitIdentifier)
+	require.True(t, config.NodeOUs.Enable)
+	require.Equal(t, caFile, config.NodeOUs.ClientOUIdentifier.Certificate)
+	require.Equal(t, msp.CLIENTOU, config.NodeOUs.ClientOUIdentifier.OrganizationalUnitIdentifier)
+	require.Equal(t, caFile, config.NodeOUs.PeerOUIdentifier.Certificate)
+	require.Equal(t, msp.PEEROU, config.NodeOUs.PeerOUIdentifier.OrganizationalUnitIdentifier)
+	require.Equal(t, caFile, config.NodeOUs.AdminOUIdentifier.Certificate)
+	require.Equal(t, msp.ADMINOU, config.NodeOUs.AdminOUIdentifier.OrganizationalUnitIdentifier)
+	require.Equal(t, caFile, config.NodeOUs.OrdererOUIdentifier.Certificate)
+	require.Equal(t, msp.ORDEREROU, config.NodeOUs.OrdererOUIdentifier.OrganizationalUnitIdentifier)
 }
 
 func cleanup(dir string) {

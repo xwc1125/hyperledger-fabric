@@ -88,8 +88,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hyperledger/fabric/core/chaincode/shim"
-	pb "github.com/hyperledger/fabric/protos/peer"
+	"github.com/hyperledger/fabric-chaincode-go/shim"
+	pb "github.com/hyperledger/fabric-protos-go/peer"
 )
 
 // SimpleChaincode example simple Chaincode implementation
@@ -102,16 +102,6 @@ type marble struct {
 	Color      string `json:"color"`
 	Size       int    `json:"size"`
 	Owner      string `json:"owner"`
-}
-
-// ===================================================================================
-// Main
-// ===================================================================================
-func main() {
-	err := shim.Start(new(SimpleChaincode))
-	if err != nil {
-		fmt.Printf("Error starting Simple chaincode: %s", err)
-	}
 }
 
 // Init initializes chaincode
@@ -228,7 +218,10 @@ func (t *SimpleChaincode) initMarble(stub shim.ChaincodeStubInterface, args []st
 	//  Save index entry to state. Only the key name is needed, no need to store a duplicate copy of the marble.
 	//  Note - passing a 'nil' value will effectively delete the key from state, therefore we pass null character as value
 	value := []byte{0x00}
-	stub.PutState(colorNameIndexKey, value)
+	err = stub.PutState(colorNameIndexKey, value)
+	if err != nil {
+		return shim.Error(err.Error())
+	}
 
 	// ==== Marble saved and indexed. Return success ====
 	fmt.Println("- end init marble")
@@ -361,7 +354,7 @@ func constructQueryResponseFromIterator(resultsIterator shim.StateQueryIteratorI
 			return nil, err
 		}
 		// Add a comma before array members, suppress it for the first array member
-		if bArrayMemberAlreadyWritten == true {
+		if bArrayMemberAlreadyWritten {
 			buffer.WriteString(",")
 		}
 		buffer.WriteString("{\"Key\":")
@@ -717,7 +710,7 @@ func (t *SimpleChaincode) getHistoryForMarble(stub shim.ChaincodeStubInterface, 
 			return shim.Error(err.Error())
 		}
 		// Add a comma before array members, suppress it for the first array member
-		if bArrayMemberAlreadyWritten == true {
+		if bArrayMemberAlreadyWritten {
 			buffer.WriteString(",")
 		}
 		buffer.WriteString("{\"TxId\":")

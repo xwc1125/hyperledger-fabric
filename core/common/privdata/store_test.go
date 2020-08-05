@@ -9,40 +9,41 @@ package privdata
 import (
 	"testing"
 
-	"github.com/hyperledger/fabric/common/cauthdsl"
-	lm "github.com/hyperledger/fabric/common/mocks/ledger"
+	"github.com/hyperledger/fabric-protos-go/peer"
+	"github.com/hyperledger/fabric/common/policydsl"
 	"github.com/hyperledger/fabric/core/common/privdata/mock"
 	"github.com/hyperledger/fabric/core/ledger"
-	"github.com/hyperledger/fabric/protos/common"
-	"github.com/hyperledger/fabric/protos/peer"
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // local interfaces to avoid import cycles
 //go:generate counterfeiter -o mock/query_executor_factory.go -fake-name QueryExecutorFactory . queryExecutorFactory
 //go:generate counterfeiter -o mock/chaincode_info_provider.go -fake-name ChaincodeInfoProvider . chaincodeInfoProvider
 //go:generate counterfeiter -o mock/identity_deserializer_factory.go -fake-name IdentityDeserializerFactory . identityDeserializerFactory
+//go:generate counterfeiter -o mock/query_executor.go -fake-name QueryExecutor . queryExecutor
 
 type queryExecutorFactory interface{ QueryExecutorFactory }
 type chaincodeInfoProvider interface{ ChaincodeInfoProvider }
 type identityDeserializerFactory interface{ IdentityDeserializerFactory }
+type queryExecutor interface{ ledger.QueryExecutor }
 
 func TestNewSimpleCollectionStore(t *testing.T) {
 	mockQueryExecutorFactory := &mock.QueryExecutorFactory{}
 	mockCCInfoProvider := &mock.ChaincodeInfoProvider{}
 
 	cs := NewSimpleCollectionStore(mockQueryExecutorFactory, mockCCInfoProvider)
-	assert.NotNil(t, cs)
-	assert.Exactly(t, mockQueryExecutorFactory, cs.qeFactory)
-	assert.Exactly(t, mockCCInfoProvider, cs.ccInfoProvider)
-	assert.NotNil(t, cs.idDeserializerFactory)
+	require.NotNil(t, cs)
+	require.Exactly(t, mockQueryExecutorFactory, cs.qeFactory)
+	require.Exactly(t, mockCCInfoProvider, cs.ccInfoProvider)
+	require.NotNil(t, cs.idDeserializerFactory)
 }
 
 func TestCollectionStore(t *testing.T) {
 	mockQueryExecutorFactory := &mock.QueryExecutorFactory{}
 	mockCCInfoProvider := &mock.ChaincodeInfoProvider{}
+	mockCCInfoProvider.AllCollectionsConfigPkgReturns(nil, errors.New("Chaincode [non-existing-chaincode] does not exist"))
 	mockIDDeserializerFactory := &mock.IdentityDeserializerFactory{}
 	mockIDDeserializerFactory.GetIdentityDeserializerReturns(&mockDeserializer{})
 
@@ -53,31 +54,31 @@ func TestCollectionStore(t *testing.T) {
 	}
 
 	mockQueryExecutorFactory.NewQueryExecutorReturns(nil, errors.New("new-query-executor-failed"))
-	_, err := cs.RetrieveCollection(common.CollectionCriteria{})
-	assert.Contains(t, err.Error(), "could not retrieve query executor for collection criteria")
+	_, err := cs.RetrieveCollection(CollectionCriteria{})
+	require.Contains(t, err.Error(), "could not retrieve query executor for collection criteria")
 
-	mockQueryExecutorFactory.NewQueryExecutorReturns(&lm.MockQueryExecutor{}, nil)
-	_, err = cs.retrieveCollectionConfigPackage(common.CollectionCriteria{Namespace: "non-existing-chaincode"}, nil)
-	assert.EqualError(t, err, "Chaincode [non-existing-chaincode] does not exist")
+	mockQueryExecutorFactory.NewQueryExecutorReturns(&mock.QueryExecutor{}, nil)
+	_, err = cs.retrieveCollectionConfigPackage(CollectionCriteria{Namespace: "non-existing-chaincode"}, nil)
+	require.EqualError(t, err, "Chaincode [non-existing-chaincode] does not exist")
 
-	_, err = cs.RetrieveCollection(common.CollectionCriteria{})
-	assert.Contains(t, err.Error(), "could not be found")
+	_, err = cs.RetrieveCollection(CollectionCriteria{})
+	require.Contains(t, err.Error(), "could not be found")
 
-	ccr := common.CollectionCriteria{Channel: "ch", Namespace: "cc", Collection: "mycollection"}
+	ccr := CollectionCriteria{Channel: "ch", Namespace: "cc", Collection: "mycollection"}
 	mockCCInfoProvider.CollectionInfoReturns(nil, errors.New("collection-info-error"))
 	_, err = cs.RetrieveCollection(ccr)
-	assert.EqualError(t, err, "collection-info-error")
+	require.EqualError(t, err, "collection-info-error")
 
-	scc := &common.StaticCollectionConfig{Name: "mycollection"}
+	scc := &peer.StaticCollectionConfig{Name: "mycollection"}
 	mockCCInfoProvider.CollectionInfoReturns(scc, nil)
 	_, err = cs.RetrieveCollection(ccr)
-	assert.Contains(t, err.Error(), "error setting up collection for collection criteria")
+	require.Contains(t, err.Error(), "error setting up collection for collection criteria")
 
 	var signers = [][]byte{[]byte("signer0"), []byte("signer1")}
-	policyEnvelope := cauthdsl.Envelope(cauthdsl.Or(cauthdsl.SignedBy(0), cauthdsl.SignedBy(1)), signers)
+	policyEnvelope := policydsl.Envelope(policydsl.Or(policydsl.SignedBy(0), policydsl.SignedBy(1)), signers)
 	accessPolicy := createCollectionPolicyConfig(policyEnvelope)
 
-	scc = &common.StaticCollectionConfig{
+	scc = &peer.StaticCollectionConfig{
 		Name:             "mycollection",
 		MemberOrgsPolicy: accessPolicy,
 		MemberOnlyRead:   false,
@@ -86,48 +87,49 @@ func TestCollectionStore(t *testing.T) {
 
 	mockCCInfoProvider.CollectionInfoReturns(scc, nil)
 	c, err := cs.RetrieveCollection(ccr)
-	assert.NoError(t, err)
-	assert.NotNil(t, c)
+	require.NoError(t, err)
+	require.NotNil(t, c)
 
 	ca, err := cs.RetrieveCollectionAccessPolicy(ccr)
-	assert.NoError(t, err)
-	assert.NotNil(t, ca)
+	require.NoError(t, err)
+	require.NotNil(t, ca)
 
-	scc = &common.StaticCollectionConfig{
+	scc = &peer.StaticCollectionConfig{
 		Name:             "mycollection",
 		MemberOrgsPolicy: accessPolicy,
 		MemberOnlyRead:   true,
 		MemberOnlyWrite:  true,
 	}
-	cc := &common.CollectionConfig{
-		Payload: &common.CollectionConfig_StaticCollectionConfig{StaticCollectionConfig: scc},
+	cc := &peer.CollectionConfig{
+		Payload: &peer.CollectionConfig_StaticCollectionConfig{StaticCollectionConfig: scc},
 	}
-	ccp := &common.CollectionConfigPackage{Config: []*common.CollectionConfig{cc}}
+	ccp := &peer.CollectionConfigPackage{Config: []*peer.CollectionConfig{cc}}
 
 	mockCCInfoProvider.CollectionInfoReturns(scc, nil)
 	mockCCInfoProvider.ChaincodeInfoReturns(
 		&ledger.DeployedChaincodeInfo{ExplicitCollectionConfigPkg: ccp},
 		nil,
 	)
+	mockCCInfoProvider.AllCollectionsConfigPkgReturns(ccp, nil)
 
 	ccc, err := cs.RetrieveCollectionConfigPackage(ccr)
-	assert.NoError(t, err)
-	assert.NotNil(t, ccc)
+	require.NoError(t, err)
+	require.NotNil(t, ccc)
 
 	signedProp, _ := protoutil.MockSignedEndorserProposalOrPanic("A", &peer.ChaincodeSpec{}, []byte("signer0"), []byte("msg1"))
-	readP, writeP, err := cs.RetrieveReadWritePermission(ccr, signedProp, &lm.MockQueryExecutor{})
-	assert.NoError(t, err)
-	assert.True(t, readP)
-	assert.True(t, writeP)
+	readP, writeP, err := cs.RetrieveReadWritePermission(ccr, signedProp, &mock.QueryExecutor{})
+	require.NoError(t, err)
+	require.True(t, readP)
+	require.True(t, writeP)
 
 	// only signer0 and signer1 are the members
 	signedProp, _ = protoutil.MockSignedEndorserProposalOrPanic("A", &peer.ChaincodeSpec{}, []byte("signer2"), []byte("msg1"))
-	readP, writeP, err = cs.RetrieveReadWritePermission(ccr, signedProp, &lm.MockQueryExecutor{})
-	assert.NoError(t, err)
-	assert.False(t, readP)
-	assert.False(t, writeP)
+	readP, writeP, err = cs.RetrieveReadWritePermission(ccr, signedProp, &mock.QueryExecutor{})
+	require.NoError(t, err)
+	require.False(t, readP)
+	require.False(t, writeP)
 
-	scc = &common.StaticCollectionConfig{
+	scc = &peer.StaticCollectionConfig{
 		Name:             "mycollection",
 		MemberOrgsPolicy: accessPolicy,
 		MemberOnlyRead:   false,
@@ -137,8 +139,8 @@ func TestCollectionStore(t *testing.T) {
 
 	// only signer0 and signer1 are the members
 	signedProp, _ = protoutil.MockSignedEndorserProposalOrPanic("A", &peer.ChaincodeSpec{}, []byte("signer2"), []byte("msg1"))
-	readP, writeP, err = cs.RetrieveReadWritePermission(ccr, signedProp, &lm.MockQueryExecutor{})
-	assert.NoError(t, err)
-	assert.True(t, readP)
-	assert.True(t, writeP)
+	readP, writeP, err = cs.RetrieveReadWritePermission(ccr, signedProp, &mock.QueryExecutor{})
+	require.NoError(t, err)
+	require.True(t, readP)
+	require.True(t, writeP)
 }

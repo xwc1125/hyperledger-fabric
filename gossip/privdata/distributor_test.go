@@ -11,6 +11,9 @@ import (
 	"fmt"
 	"testing"
 
+	proto "github.com/hyperledger/fabric-protos-go/gossip"
+	"github.com/hyperledger/fabric-protos-go/peer"
+	"github.com/hyperledger/fabric-protos-go/transientstore"
 	"github.com/hyperledger/fabric/core/common/privdata"
 	"github.com/hyperledger/fabric/gossip/api"
 	gcommon "github.com/hyperledger/fabric/gossip/common"
@@ -19,60 +22,15 @@ import (
 	gossip2 "github.com/hyperledger/fabric/gossip/gossip"
 	"github.com/hyperledger/fabric/gossip/metrics"
 	"github.com/hyperledger/fabric/gossip/metrics/mocks"
+	mocks2 "github.com/hyperledger/fabric/gossip/privdata/mocks"
 	"github.com/hyperledger/fabric/gossip/protoext"
-	"github.com/hyperledger/fabric/protos/common"
-	proto "github.com/hyperledger/fabric/protos/gossip"
-	"github.com/hyperledger/fabric/protos/transientstore"
 	"github.com/hyperledger/fabric/protoutil"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
-type collectionAccessFactoryMock struct {
-	mock.Mock
-}
-
-func (mock *collectionAccessFactoryMock) AccessPolicy(config *common.CollectionConfig, chainID string) (privdata.CollectionAccessPolicy, error) {
-	res := mock.Called(config, chainID)
-	return res.Get(0).(privdata.CollectionAccessPolicy), res.Error(1)
-}
-
-type collectionAccessPolicyMock struct {
-	mock.Mock
-}
-
-func (mock *collectionAccessPolicyMock) AccessFilter() privdata.Filter {
-	args := mock.Called()
-	return args.Get(0).(privdata.Filter)
-}
-
-func (mock *collectionAccessPolicyMock) RequiredPeerCount() int {
-	args := mock.Called()
-	return args.Int(0)
-}
-
-func (mock *collectionAccessPolicyMock) MaximumPeerCount() int {
-	args := mock.Called()
-	return args.Int(0)
-}
-
-func (mock *collectionAccessPolicyMock) MemberOrgs() []string {
-	args := mock.Called()
-	return args.Get(0).([]string)
-}
-
-func (mock *collectionAccessPolicyMock) IsMemberOnlyRead() bool {
-	args := mock.Called()
-	return args.Get(0).(bool)
-}
-
-func (mock *collectionAccessPolicyMock) IsMemberOnlyWrite() bool {
-	args := mock.Called()
-	return args.Get(0).(bool)
-}
-
-func (mock *collectionAccessPolicyMock) Setup(requiredPeerCount int, maxPeerCount int,
-	accessFilter privdata.Filter, orgs []string, memberOnlyRead bool) {
+func Setup(mock *mocks2.CollectionAccessPolicy, requiredPeerCount int, maxPeerCount int,
+	accessFilter privdata.Filter, orgs map[string]struct{}, memberOnlyRead bool) {
 	mock.On("AccessFilter").Return(accessFilter)
 	mock.On("RequiredPeerCount").Return(requiredPeerCount)
 	mock.On("MaximumPeerCount").Return(maxPeerCount)
@@ -154,10 +112,10 @@ func TestDistributor(t *testing.T) {
 			SendCriteria:   sendCriteria,
 		}
 	}).Return(nil)
-	accessFactoryMock := &collectionAccessFactoryMock{}
-	c1ColConfig := &common.CollectionConfig{
-		Payload: &common.CollectionConfig_StaticCollectionConfig{
-			StaticCollectionConfig: &common.StaticCollectionConfig{
+	accessFactoryMock := &mocks2.CollectionAccessFactory{}
+	c1ColConfig := &peer.CollectionConfig{
+		Payload: &peer.CollectionConfig_StaticCollectionConfig{
+			StaticCollectionConfig: &peer.StaticCollectionConfig{
 				Name:              "c1",
 				RequiredPeerCount: 1,
 				MaximumPeerCount:  1,
@@ -165,9 +123,9 @@ func TestDistributor(t *testing.T) {
 		},
 	}
 
-	c2ColConfig := &common.CollectionConfig{
-		Payload: &common.CollectionConfig_StaticCollectionConfig{
-			StaticCollectionConfig: &common.StaticCollectionConfig{
+	c2ColConfig := &peer.CollectionConfig{
+		Payload: &peer.CollectionConfig_StaticCollectionConfig{
+			StaticCollectionConfig: &peer.StaticCollectionConfig{
 				Name:              "c2",
 				RequiredPeerCount: 1,
 				MaximumPeerCount:  1,
@@ -175,10 +133,13 @@ func TestDistributor(t *testing.T) {
 		},
 	}
 
-	policyMock := &collectionAccessPolicyMock{}
-	policyMock.Setup(1, 2, func(_ protoutil.SignedData) bool {
+	policyMock := &mocks2.CollectionAccessPolicy{}
+	Setup(policyMock, 1, 2, func(_ protoutil.SignedData) bool {
 		return true
-	}, []string{"org1", "org2"}, false)
+	}, map[string]struct{}{
+		"org1": {},
+		"org2": {},
+	}, false)
 
 	accessFactoryMock.On("AccessPolicy", c1ColConfig, channelID).Return(policyMock, nil)
 	accessFactoryMock.On("AccessPolicy", c2ColConfig, channelID).Return(policyMock, nil)
@@ -191,28 +152,28 @@ func TestDistributor(t *testing.T) {
 	pvtData := pdFactory.addRWSet().addNSRWSet("ns1", "c1", "c2").addRWSet().addNSRWSet("ns2", "c1", "c2").create()
 	err := d.Distribute("tx1", &transientstore.TxPvtReadWriteSetWithConfigInfo{
 		PvtRwset: pvtData[0].WriteSet,
-		CollectionConfigs: map[string]*common.CollectionConfigPackage{
+		CollectionConfigs: map[string]*peer.CollectionConfigPackage{
 			"ns1": {
-				Config: []*common.CollectionConfig{c1ColConfig, c2ColConfig},
+				Config: []*peer.CollectionConfig{c1ColConfig, c2ColConfig},
 			},
 		},
 	}, 0)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	err = d.Distribute("tx2", &transientstore.TxPvtReadWriteSetWithConfigInfo{
 		PvtRwset: pvtData[1].WriteSet,
-		CollectionConfigs: map[string]*common.CollectionConfigPackage{
+		CollectionConfigs: map[string]*peer.CollectionConfigPackage{
 			"ns2": {
-				Config: []*common.CollectionConfig{c1ColConfig, c2ColConfig},
+				Config: []*peer.CollectionConfig{c1ColConfig, c2ColConfig},
 			},
 		},
 	}, 0)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	expectedMaxCount := map[string]int{}
 	expectedMinAck := map[string]int{}
 
 	i := 0
-	assert.Len(t, sendings, 8)
+	require.Len(t, sendings, 8)
 	for dis := range sendings {
 		key := fmt.Sprintf("%s~%s", dis.PrivatePayload.Namespace, dis.PrivatePayload.CollectionName)
 		expectedMaxCount[key] += dis.SendCriteria.MaxPeers
@@ -224,28 +185,28 @@ func TestDistributor(t *testing.T) {
 	}
 
 	// Ensure MaxPeers is maxInternalPeers which is 2
-	assert.Equal(t, 2, expectedMaxCount["ns1~c1"])
-	assert.Equal(t, 2, expectedMaxCount["ns2~c2"])
+	require.Equal(t, 2, expectedMaxCount["ns1~c1"])
+	require.Equal(t, 2, expectedMaxCount["ns2~c2"])
 
 	// and MinAck is minInternalPeers which is 1
-	assert.Equal(t, 1, expectedMinAck["ns1~c1"])
-	assert.Equal(t, 1, expectedMinAck["ns2~c2"])
+	require.Equal(t, 1, expectedMinAck["ns1~c1"])
+	require.Equal(t, 1, expectedMinAck["ns2~c2"])
 
 	// Channel is empty after we read 8 times from it
-	assert.Len(t, sendings, 0)
+	require.Len(t, sendings, 0)
 
 	// Bad path: dependencies (gossip and others) don't work properly
 	g.err = errors.New("failed obtaining filter")
 	err = d.Distribute("tx1", &transientstore.TxPvtReadWriteSetWithConfigInfo{
 		PvtRwset: pvtData[0].WriteSet,
-		CollectionConfigs: map[string]*common.CollectionConfigPackage{
+		CollectionConfigs: map[string]*peer.CollectionConfigPackage{
 			"ns1": {
-				Config: []*common.CollectionConfig{c1ColConfig, c2ColConfig},
+				Config: []*peer.CollectionConfig{c1ColConfig, c2ColConfig},
 			},
 		},
 	}, 0)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "failed obtaining filter")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "failed obtaining filter")
 
 	g.Mock = mock.Mock{}
 	g.On("SendByCriteria", mock.Anything, mock.Anything).Return(errors.New("failed sending"))
@@ -263,18 +224,18 @@ func TestDistributor(t *testing.T) {
 	g.err = nil
 	err = d.Distribute("tx1", &transientstore.TxPvtReadWriteSetWithConfigInfo{
 		PvtRwset: pvtData[0].WriteSet,
-		CollectionConfigs: map[string]*common.CollectionConfigPackage{
+		CollectionConfigs: map[string]*peer.CollectionConfigPackage{
 			"ns1": {
-				Config: []*common.CollectionConfig{c1ColConfig, c2ColConfig},
+				Config: []*peer.CollectionConfig{c1ColConfig, c2ColConfig},
 			},
 		},
 	}, 0)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "Failed disseminating 4 out of 4 private dissemination plans")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "Failed disseminating 2 out of 2 private dissemination plans")
 
-	assert.Equal(t,
+	require.Equal(t,
 		[]string{"channel", channelID},
 		testMetricProvider.FakeSendDuration.WithArgsForCall(0),
 	)
-	assert.True(t, testMetricProvider.FakeSendDuration.ObserveArgsForCall(0) > 0)
+	require.True(t, testMetricProvider.FakeSendDuration.ObserveArgsForCall(0) > 0)
 }

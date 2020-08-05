@@ -7,12 +7,12 @@ SPDX-License-Identifier: Apache-2.0
 package common
 
 import (
+	cb "github.com/hyperledger/fabric-protos-go/common"
+	ab "github.com/hyperledger/fabric-protos-go/orderer"
+	pb "github.com/hyperledger/fabric-protos-go/peer"
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/common/util"
 	"github.com/hyperledger/fabric/internal/pkg/identity"
-	cb "github.com/hyperledger/fabric/protos/common"
-	ab "github.com/hyperledger/fabric/protos/orderer"
-	pb "github.com/hyperledger/fabric/protos/peer"
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
 )
@@ -71,11 +71,16 @@ func (d *DeliverClient) readBlock() (*cb.Block, error) {
 	}
 	switch t := msg.Type.(type) {
 	case *ab.DeliverResponse_Status:
-		logger.Infof("Got status: %v", t)
+		logger.Infof("Expect block, but got status: %v", t)
 		return nil, errors.Errorf("can't read the block: %v", t)
 	case *ab.DeliverResponse_Block:
 		logger.Infof("Received block: %v", t.Block.Header.Number)
-		d.Service.Recv() // Flush the success message
+		if resp, err := d.Service.Recv(); err != nil { // Flush the success message
+			logger.Errorf("Failed to flush success message: %s", err)
+		} else if status := resp.GetStatus(); status != cb.Status_SUCCESS {
+			logger.Errorf("Expect status to be SUCCESS, got: %s", status)
+		}
+
 		return t.Block, nil
 	default:
 		return nil, errors.Errorf("response error: unknown type %T", t)

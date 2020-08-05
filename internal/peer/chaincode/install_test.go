@@ -12,11 +12,12 @@ import (
 	"os"
 	"testing"
 
+	pb "github.com/hyperledger/fabric-protos-go/peer"
+	"github.com/hyperledger/fabric/bccsp/sw"
 	"github.com/hyperledger/fabric/internal/peer/common"
-	pb "github.com/hyperledger/fabric/protos/peer"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func initInstallTest(t *testing.T, fsPath string, ec pb.EndorserClient, mockResponse *pb.ProposalResponse) (*cobra.Command, *ChaincodeCmdFactory) {
@@ -41,8 +42,10 @@ func initInstallTest(t *testing.T, fsPath string, ec pb.EndorserClient, mockResp
 		Signer:          signer,
 		EndorserClients: []pb.EndorserClient{ec},
 	}
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
 
-	cmd := installCmd(mockCF, nil)
+	cmd := installCmd(mockCF, nil, cryptoProvider)
 	addFlags(cmd)
 
 	return cmd, mockCF
@@ -54,7 +57,7 @@ func cleanupInstallTest(fsPath string) {
 
 func TestInstallBadVersion(t *testing.T) {
 	fsPath, err := ioutil.TempDir("", "installbadversion")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	cmd, _ := initInstallTest(t, fsPath, nil, nil)
 	defer cleanupInstallTest(fsPath)
@@ -69,7 +72,7 @@ func TestInstallBadVersion(t *testing.T) {
 
 func TestInstallNonExistentCC(t *testing.T) {
 	fsPath, err := ioutil.TempDir("", "install-nonexistentcc")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	cmd, _ := initInstallTest(t, fsPath, nil, nil)
 	defer cleanupInstallTest(fsPath)
@@ -143,7 +146,7 @@ func installCC(t *testing.T) error {
 	defer viper.Reset()
 
 	fsPath, err := ioutil.TempDir("", "installLegacyEx02")
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	cmd, _ := initInstallTest(t, fsPath, nil, nil)
 	defer cleanupInstallTest(fsPath)
 
@@ -161,21 +164,4 @@ func TestInstall(t *testing.T) {
 	if err := installCC(t); err != nil {
 		t.Fatalf("Install failed with error: %v", err)
 	}
-}
-
-func newInstallerForTest(t *testing.T, ec pb.EndorserClient) (installer *Installer, cleanup func()) {
-	fsPath, err := ioutil.TempDir("", "installerForTest")
-	assert.NoError(t, err)
-	_, mockCF := initInstallTest(t, fsPath, ec, nil)
-
-	i := &Installer{
-		EndorserClients: mockCF.EndorserClients,
-		Signer:          mockCF.Signer,
-	}
-
-	cleanupFunc := func() {
-		cleanupInstallTest(fsPath)
-	}
-
-	return i, cleanupFunc
 }

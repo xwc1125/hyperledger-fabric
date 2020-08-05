@@ -25,10 +25,12 @@ type Config struct {
 	TLSEnabled      bool
 	Keepalive       time.Duration
 	ExecuteTimeout  time.Duration
+	InstallTimeout  time.Duration
 	StartupTimeout  time.Duration
 	LogFormat       string
 	LogLevel        string
 	ShimLogLevel    string
+	SCCAllowlist    map[string]bool
 }
 
 func GlobalConfig() *Config {
@@ -50,9 +52,15 @@ func (c *Config) load() {
 	if c.ExecuteTimeout < time.Second {
 		c.ExecuteTimeout = defaultExecutionTimeout
 	}
+	c.InstallTimeout = viper.GetDuration("chaincode.installTimeout")
 	c.StartupTimeout = viper.GetDuration("chaincode.startuptimeout")
 	if c.StartupTimeout < minimumStartupTimeout {
 		c.StartupTimeout = minimumStartupTimeout
+	}
+
+	c.SCCAllowlist = map[string]bool{}
+	for k, v := range viper.GetStringMapString("chaincode.system") {
+		c.SCCAllowlist[k] = parseBool(v)
 	}
 
 	c.LogFormat = viper.GetString("chaincode.logging.format")
@@ -62,6 +70,15 @@ func (c *Config) load() {
 	c.TotalQueryLimit = 10000 // need a default just in case it's not set
 	if viper.IsSet("ledger.state.totalQueryLimit") {
 		c.TotalQueryLimit = viper.GetInt("ledger.state.totalQueryLimit")
+	}
+}
+
+func parseBool(s string) bool {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "true", "t", "1", "enable", "enabled", "yes":
+		return true
+	default:
+		return false
 	}
 }
 

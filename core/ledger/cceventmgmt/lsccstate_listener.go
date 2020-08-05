@@ -7,13 +7,18 @@ SPDX-License-Identifier: Apache-2.0
 package cceventmgmt
 
 import (
+	"github.com/hyperledger/fabric-protos-go/ledger/rwset/kvrwset"
 	"github.com/hyperledger/fabric/core/ledger"
-	"github.com/hyperledger/fabric/protos/ledger/rwset/kvrwset"
 )
 
 // KVLedgerLSCCStateListener listens for state changes for chaincode lifecycle
 type KVLedgerLSCCStateListener struct {
 	DeployedChaincodeInfoProvider ledger.DeployedChaincodeInfoProvider
+}
+
+// Name returns the name of the listener
+func (listener *KVLedgerLSCCStateListener) Name() string {
+	return "lscc state listener"
 }
 
 func (listener *KVLedgerLSCCStateListener) Initialize(ledgerID string, qe ledger.SimpleQueryExecutor) error {

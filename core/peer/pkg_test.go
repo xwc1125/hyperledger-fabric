@@ -13,28 +13,21 @@ import (
 	"errors"
 	"io/ioutil"
 	"net"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/golang/protobuf/proto"
+	cb "github.com/hyperledger/fabric-protos-go/common"
+	mspproto "github.com/hyperledger/fabric-protos-go/msp"
+	pb "github.com/hyperledger/fabric-protos-go/peer"
 	configtxtest "github.com/hyperledger/fabric/common/configtx/test"
-	"github.com/hyperledger/fabric/common/metrics/disabled"
-	"github.com/hyperledger/fabric/core/chaincode/platforms"
-	"github.com/hyperledger/fabric/core/comm"
-	"github.com/hyperledger/fabric/core/comm/testpb"
-	"github.com/hyperledger/fabric/core/ledger"
-	"github.com/hyperledger/fabric/core/ledger/ledgermgmt"
 	"github.com/hyperledger/fabric/core/ledger/mock"
-	ledgermocks "github.com/hyperledger/fabric/core/ledger/mock"
-	"github.com/hyperledger/fabric/core/ledger/util"
 	"github.com/hyperledger/fabric/core/peer"
+	"github.com/hyperledger/fabric/internal/pkg/comm"
+	"github.com/hyperledger/fabric/internal/pkg/comm/testpb"
+	"github.com/hyperledger/fabric/internal/pkg/txflags"
 	"github.com/hyperledger/fabric/msp"
-	cb "github.com/hyperledger/fabric/protos/common"
-	mspproto "github.com/hyperledger/fabric/protos/msp"
-	pb "github.com/hyperledger/fabric/protos/peer"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -95,6 +88,18 @@ func createMSPConfig(rootCerts, tlsRootCerts, tlsIntermediateCerts [][]byte,
 		TlsRootCerts:         tlsRootCerts,
 		TlsIntermediateCerts: tlsIntermediateCerts,
 		Name:                 mspID,
+		FabricNodeOus: &mspproto.FabricNodeOUs{
+			Enable: true,
+			ClientOuIdentifier: &mspproto.FabricOUIdentifier{
+				OrganizationalUnitIdentifier: "client",
+			},
+			PeerOuIdentifier: &mspproto.FabricOUIdentifier{
+				OrganizationalUnitIdentifier: "peer",
+			},
+			AdminOuIdentifier: &mspproto.FabricOUIdentifier{
+				OrganizationalUnitIdentifier: "admin",
+			},
+		},
 	}
 
 	fmpsjs, err := proto.Marshal(fmspconf)
@@ -105,14 +110,14 @@ func createMSPConfig(rootCerts, tlsRootCerts, tlsIntermediateCerts [][]byte,
 	return mspconf, nil
 }
 
-func createConfigBlock(chainID string, appMSPConf, ordererMSPConf *mspproto.MSPConfig,
+func createConfigBlock(channelID string, appMSPConf, ordererMSPConf *mspproto.MSPConfig,
 	appOrgID, ordererOrgID string) (*cb.Block, error) {
-	block, err := configtxtest.MakeGenesisBlockFromMSPs(chainID, appMSPConf, ordererMSPConf, appOrgID, ordererOrgID)
+	block, err := configtxtest.MakeGenesisBlockFromMSPs(channelID, appMSPConf, ordererMSPConf, appOrgID, ordererOrgID)
 	if block == nil || err != nil {
 		return block, err
 	}
 
-	txsFilter := util.NewTxValidationFlagsSetValue(len(block.Data.Data), pb.TxValidationCode_VALID)
+	txsFilter := txflags.NewWithValues(len(block.Data.Data), pb.TxValidationCode_VALID)
 	block.Metadata.Metadata[cb.BlockMetadataIndex_TRANSACTIONS_FILTER] = txsFilter
 
 	return block, nil
@@ -164,7 +169,7 @@ func TestUpdateRootsFromConfigBlock(t *testing.T) {
 	require.NoError(t, err)
 
 	serverConfig := comm.ServerConfig{
-		SecOpts: &comm.SecureOptions{
+		SecOpts: comm.SecureOptions{
 			UseTLS:            true,
 			Certificate:       org1Server1Cert,
 			Key:               org1Server1Key,
@@ -177,32 +182,8 @@ func TestUpdateRootsFromConfigBlock(t *testing.T) {
 	defer cleanup()
 	peerInstance.CredentialSupport = comm.NewCredentialSupport()
 
-	testDir, err := ioutil.TempDir("", "peer-pkg")
-	require.NoError(t, err)
-	defer os.RemoveAll(testDir)
-
-	ledgermgmt.Initialize(&ledgermgmt.Initializer{
-		CustomTxProcessors:            nil,
-		PlatformRegistry:              &platforms.Registry{},
-		DeployedChaincodeInfoProvider: &ledgermocks.DeployedChaincodeInfoProvider{},
-		MembershipInfoProvider:        nil,
-		MetricsProvider:               &disabled.Provider{},
-		Config: &ledger.Config{
-			RootFSPath:    filepath.Join(testDir, "ledgersData"),
-			StateDBConfig: &ledger.StateDBConfig{},
-			PrivateDataConfig: &ledger.PrivateDataConfig{
-				MaxBatchSize:    5000,
-				BatchesInterval: 1000,
-				PurgeInterval:   100,
-			},
-			HistoryDBConfig: &ledger.HistoryDBConfig{
-				Enabled: true,
-			},
-		},
-	})
-
 	createChannel := func(t *testing.T, cid string, block *cb.Block) {
-		err = peerInstance.CreateChannel(block, nil, &mock.DeployedChaincodeInfoProvider{}, nil, nil)
+		err = peerInstance.CreateChannel(cid, block, &mock.DeployedChaincodeInfoProvider{}, nil, nil)
 		if err != nil {
 			t.Fatalf("Failed to create config block (%s)", err)
 		}
@@ -300,11 +281,11 @@ func TestUpdateRootsFromConfigBlock(t *testing.T) {
 				return
 			}
 
-			peerInstance.Server = server
+			peerInstance.SetServer(server)
 			peerInstance.ServerConfig = test.serverConfig
 
-			assert.NoError(t, err, "NewGRPCServer should not have returned an error")
-			assert.NotNil(t, server, "NewGRPCServer should have created a server")
+			require.NoError(t, err, "NewGRPCServer should not have returned an error")
+			require.NotNil(t, server, "NewGRPCServer should have created a server")
 			// register a GRPC test service
 			testpb.RegisterTestServiceServer(server.Server(), &testServiceServer{})
 			go server.Start()
@@ -322,18 +303,18 @@ func TestUpdateRootsFromConfigBlock(t *testing.T) {
 			// invoke the EmptyCall service with good options but should fail
 			// until channel is created and root CAs are updated
 			_, err = invokeEmptyCall(testAddress, test.goodOptions)
-			assert.Error(t, err, "Expected error invoking the EmptyCall service ")
+			require.Error(t, err, "Expected error invoking the EmptyCall service ")
 
 			// creating channel should update the trusted client roots
 			test.createChannel(t)
 
 			// invoke the EmptyCall service with good options
 			_, err = invokeEmptyCall(testAddress, test.goodOptions)
-			assert.NoError(t, err, "Failed to invoke the EmptyCall service")
+			require.NoError(t, err, "Failed to invoke the EmptyCall service")
 
 			// invoke the EmptyCall service with bad options
 			_, err = invokeEmptyCall(testAddress, test.badOptions)
-			assert.Error(t, err, "Expected error using bad dial options")
+			require.Error(t, err, "Expected error using bad dial options")
 		})
 	}
 }

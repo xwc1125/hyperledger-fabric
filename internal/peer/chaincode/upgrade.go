@@ -11,8 +11,9 @@ import (
 	"errors"
 	"fmt"
 
-	protcommon "github.com/hyperledger/fabric/protos/common"
-	pb "github.com/hyperledger/fabric/protos/peer"
+	protcommon "github.com/hyperledger/fabric-protos-go/common"
+	pb "github.com/hyperledger/fabric-protos-go/peer"
+	"github.com/hyperledger/fabric/bccsp"
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/spf13/cobra"
 )
@@ -22,14 +23,14 @@ var chaincodeUpgradeCmd *cobra.Command
 const upgradeCmdName = "upgrade"
 
 // upgradeCmd returns the cobra command for Chaincode Upgrade
-func upgradeCmd(cf *ChaincodeCmdFactory) *cobra.Command {
+func upgradeCmd(cf *ChaincodeCmdFactory, cryptoProvider bccsp.BCCSP) *cobra.Command {
 	chaincodeUpgradeCmd = &cobra.Command{
 		Use:       upgradeCmdName,
 		Short:     "Upgrade chaincode.",
 		Long:      "Upgrade an existing chaincode with the specified one. The new chaincode will immediately replace the existing chaincode upon the transaction committed.",
 		ValidArgs: []string{"1"},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return chaincodeUpgrade(cmd, args, cf)
+			return chaincodeUpgrade(cmd, args, cf, cryptoProvider)
 		},
 	}
 	flagList := []string{
@@ -86,9 +87,9 @@ func upgrade(cmd *cobra.Command, cf *ChaincodeCmdFactory) (*protcommon.Envelope,
 	if err != nil {
 		return nil, fmt.Errorf("error endorsing %s: %s", chainFuncName, err)
 	}
-	logger.Debugf("endorse upgrade proposal, get response <%v>", proposalResponse.Response)
 
 	if proposalResponse != nil {
+		logger.Debugf("endorse upgrade proposal, get response <%v>", proposalResponse.Response)
 		// assemble a signed transaction (it's an Envelope message)
 		env, err := protoutil.CreateSignedTx(prop, cf.Signer, proposalResponse)
 		if err != nil {
@@ -103,7 +104,7 @@ func upgrade(cmd *cobra.Command, cf *ChaincodeCmdFactory) (*protcommon.Envelope,
 
 // chaincodeUpgrade upgrades the chaincode. On success, the new chaincode
 // version is printed to STDOUT
-func chaincodeUpgrade(cmd *cobra.Command, args []string, cf *ChaincodeCmdFactory) error {
+func chaincodeUpgrade(cmd *cobra.Command, args []string, cf *ChaincodeCmdFactory, cryptoProvider bccsp.BCCSP) error {
 	if channelID == "" {
 		return errors.New("The required parameter 'channelID' is empty. Rerun the command with -C flag")
 	}
@@ -112,7 +113,7 @@ func chaincodeUpgrade(cmd *cobra.Command, args []string, cf *ChaincodeCmdFactory
 
 	var err error
 	if cf == nil {
-		cf, err = InitCmdFactory(cmd.Name(), true, true)
+		cf, err = InitCmdFactory(cmd.Name(), true, true, cryptoProvider)
 		if err != nil {
 			return err
 		}

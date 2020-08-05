@@ -10,22 +10,21 @@ import (
 	"testing"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric-protos-go/common"
+	"github.com/hyperledger/fabric-protos-go/peer"
+	"github.com/hyperledger/fabric/bccsp/sw"
 	"github.com/hyperledger/fabric/common/ledger/testutil"
-	"github.com/hyperledger/fabric/common/mocks/config"
 	"github.com/hyperledger/fabric/common/semaphore"
-	util2 "github.com/hyperledger/fabric/common/util"
+	tmocks "github.com/hyperledger/fabric/core/committer/txvalidator/mocks"
 	"github.com/hyperledger/fabric/core/committer/txvalidator/v20/mocks"
 	ledger2 "github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/rwsetutil"
-	"github.com/hyperledger/fabric/core/ledger/util"
-	ledgerUtil "github.com/hyperledger/fabric/core/ledger/util"
 	mocktxvalidator "github.com/hyperledger/fabric/core/mocks/txvalidator"
+	"github.com/hyperledger/fabric/internal/pkg/txflags"
 	mspmgmt "github.com/hyperledger/fabric/msp/mgmt"
-	"github.com/hyperledger/fabric/protos/common"
-	"github.com/hyperledger/fabric/protos/peer"
 	"github.com/hyperledger/fabric/protoutil"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 // mockDispatcher is still useful for the parallel test. Auto-generated mocks
@@ -53,15 +52,20 @@ func testValidationWithNTXes(t *testing.T, nBlocks int) {
 		t.Fatalf("Could not construct ProposalResponsePayload bytes, err: %s", err)
 	}
 
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+
 	mockDispatcher := &mockDispatcher{}
 	mockLedger := &mocks.LedgerResources{}
+	mockCapabilities := &tmocks.ApplicationCapabilities{}
 	mockLedger.On("GetTransactionByID", mock.Anything).Return(nil, ledger2.NotFoundInIndexErr("Day after day, day after day"))
 	tValidator := &TxValidator{
-		ChainID:          "",
+		ChannelID:        "",
 		Semaphore:        semaphore.New(10),
-		ChannelResources: &mocktxvalidator.Support{ACVal: &config.MockApplicationCapabilities{}},
+		ChannelResources: &mocktxvalidator.Support{ACVal: mockCapabilities},
 		Dispatcher:       mockDispatcher,
 		LedgerResources:  mockLedger,
+		CryptoProvider:   cryptoProvider,
 	}
 
 	sr := [][]byte{}
@@ -72,35 +76,35 @@ func testValidationWithNTXes(t *testing.T, nBlocks int) {
 
 	tValidator.Validate(block)
 
-	txsfltr := util.TxValidationFlags(block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
+	txsfltr := txflags.ValidationFlags(block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
 
 	for i := 0; i < nBlocks; i++ {
-		assert.True(t, txsfltr.IsSetTo(i, peer.TxValidationCode_VALID))
+		require.True(t, txsfltr.IsSetTo(i, peer.TxValidationCode_VALID))
 	}
 }
 
 func TestDetectTXIdDuplicates(t *testing.T) {
 	txids := []string{"", "1", "2", "3", "", "2", ""}
-	txsfltr := ledgerUtil.NewTxValidationFlags(len(txids))
+	txsfltr := txflags.New(len(txids))
 	markTXIdDuplicates(txids, txsfltr)
-	assert.True(t, txsfltr.IsSetTo(0, peer.TxValidationCode_NOT_VALIDATED))
-	assert.True(t, txsfltr.IsSetTo(1, peer.TxValidationCode_NOT_VALIDATED))
-	assert.True(t, txsfltr.IsSetTo(2, peer.TxValidationCode_NOT_VALIDATED))
-	assert.True(t, txsfltr.IsSetTo(3, peer.TxValidationCode_NOT_VALIDATED))
-	assert.True(t, txsfltr.IsSetTo(4, peer.TxValidationCode_NOT_VALIDATED))
-	assert.True(t, txsfltr.IsSetTo(5, peer.TxValidationCode_DUPLICATE_TXID))
-	assert.True(t, txsfltr.IsSetTo(6, peer.TxValidationCode_NOT_VALIDATED))
+	require.True(t, txsfltr.IsSetTo(0, peer.TxValidationCode_NOT_VALIDATED))
+	require.True(t, txsfltr.IsSetTo(1, peer.TxValidationCode_NOT_VALIDATED))
+	require.True(t, txsfltr.IsSetTo(2, peer.TxValidationCode_NOT_VALIDATED))
+	require.True(t, txsfltr.IsSetTo(3, peer.TxValidationCode_NOT_VALIDATED))
+	require.True(t, txsfltr.IsSetTo(4, peer.TxValidationCode_NOT_VALIDATED))
+	require.True(t, txsfltr.IsSetTo(5, peer.TxValidationCode_DUPLICATE_TXID))
+	require.True(t, txsfltr.IsSetTo(6, peer.TxValidationCode_NOT_VALIDATED))
 
 	txids = []string{"", "1", "2", "3", "", "21", ""}
-	txsfltr = ledgerUtil.NewTxValidationFlags(len(txids))
+	txsfltr = txflags.New(len(txids))
 	markTXIdDuplicates(txids, txsfltr)
-	assert.True(t, txsfltr.IsSetTo(0, peer.TxValidationCode_NOT_VALIDATED))
-	assert.True(t, txsfltr.IsSetTo(1, peer.TxValidationCode_NOT_VALIDATED))
-	assert.True(t, txsfltr.IsSetTo(2, peer.TxValidationCode_NOT_VALIDATED))
-	assert.True(t, txsfltr.IsSetTo(3, peer.TxValidationCode_NOT_VALIDATED))
-	assert.True(t, txsfltr.IsSetTo(4, peer.TxValidationCode_NOT_VALIDATED))
-	assert.True(t, txsfltr.IsSetTo(5, peer.TxValidationCode_NOT_VALIDATED))
-	assert.True(t, txsfltr.IsSetTo(6, peer.TxValidationCode_NOT_VALIDATED))
+	require.True(t, txsfltr.IsSetTo(0, peer.TxValidationCode_NOT_VALIDATED))
+	require.True(t, txsfltr.IsSetTo(1, peer.TxValidationCode_NOT_VALIDATED))
+	require.True(t, txsfltr.IsSetTo(2, peer.TxValidationCode_NOT_VALIDATED))
+	require.True(t, txsfltr.IsSetTo(3, peer.TxValidationCode_NOT_VALIDATED))
+	require.True(t, txsfltr.IsSetTo(4, peer.TxValidationCode_NOT_VALIDATED))
+	require.True(t, txsfltr.IsSetTo(5, peer.TxValidationCode_NOT_VALIDATED))
+	require.True(t, txsfltr.IsSetTo(6, peer.TxValidationCode_NOT_VALIDATED))
 }
 
 func TestBlockValidationDuplicateTXId(t *testing.T) {
@@ -116,32 +120,36 @@ func TestBlockValidationDuplicateTXId(t *testing.T) {
 		t.Fatalf("Could not construct ProposalResponsePayload bytes, err: %s", err)
 	}
 
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+
 	mockDispatcher := &mockDispatcher{}
-	acv := &config.MockApplicationCapabilities{
-		ForbidDuplicateTXIdInBlockRv: true,
-	}
+	mockCapabilities := &tmocks.ApplicationCapabilities{}
+	mockCapabilities.On("ForbidDuplicateTXIdInBlock").Return(true)
 	mockLedger := &mocks.LedgerResources{}
 	mockLedger.On("GetTransactionByID", mock.Anything).Return(nil, ledger2.NotFoundInIndexErr("As idle as a painted ship upon a painted ocean"))
 	tValidator := &TxValidator{
-		ChainID:          "",
+		ChannelID:        "",
 		Semaphore:        semaphore.New(10),
-		ChannelResources: &mocktxvalidator.Support{ACVal: acv},
+		ChannelResources: &mocktxvalidator.Support{ACVal: mockCapabilities},
 		Dispatcher:       mockDispatcher,
 		LedgerResources:  mockLedger,
+		CryptoProvider:   cryptoProvider,
 	}
 
 	envs := []*common.Envelope{}
 	env, _, err := testutil.ConstructTransaction(t, pubSimulationResBytes, "", true)
+	require.NoError(t, err)
 	envs = append(envs, env)
 	envs = append(envs, env)
 	block := testutil.NewBlock(envs, 1, []byte("Water, water everywhere and all the boards did shrink"))
 
 	tValidator.Validate(block)
 
-	txsfltr := util.TxValidationFlags(block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
+	txsfltr := txflags.ValidationFlags(block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
 
-	assert.True(t, txsfltr.IsSetTo(0, peer.TxValidationCode_VALID))
-	assert.True(t, txsfltr.IsSetTo(1, peer.TxValidationCode_DUPLICATE_TXID))
+	require.True(t, txsfltr.IsSetTo(0, peer.TxValidationCode_VALID))
+	require.True(t, txsfltr.IsSetTo(1, peer.TxValidationCode_DUPLICATE_TXID))
 }
 
 func TestBlockValidation(t *testing.T) {
@@ -162,20 +170,25 @@ func TestVeryLargeParallelBlockValidation(t *testing.T) {
 }
 
 func TestTxValidationFailure_InvalidTxid(t *testing.T) {
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+
 	mockLedger := &mocks.LedgerResources{}
 	mockLedger.On("GetTransactionByID", mock.Anything).Return(nil, ledger2.NotFoundInIndexErr("Water, water, everywhere, nor any drop to drink"))
+	mockCapabilities := &tmocks.ApplicationCapabilities{}
 	tValidator := &TxValidator{
-		ChainID:          "",
+		ChannelID:        "",
 		Semaphore:        semaphore.New(10),
-		ChannelResources: &mocktxvalidator.Support{ACVal: &config.MockApplicationCapabilities{}},
+		ChannelResources: &mocktxvalidator.Support{ACVal: mockCapabilities},
 		Dispatcher:       &mockDispatcher{},
 		LedgerResources:  mockLedger,
+		CryptoProvider:   cryptoProvider,
 	}
 
-	mockSigner, err := mspmgmt.GetLocalMSP().GetDefaultSigningIdentity()
-	assert.NoError(t, err)
+	mockSigner, err := mspmgmt.GetLocalMSP(cryptoProvider).GetDefaultSigningIdentity()
+	require.NoError(t, err)
 	mockSignerSerialized, err := mockSigner.Serialize()
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Create simple endorsement transaction
 	payload := &common.Payload{
@@ -183,7 +196,7 @@ func TestTxValidationFailure_InvalidTxid(t *testing.T) {
 			ChannelHeader: protoutil.MarshalOrPanic(&common.ChannelHeader{
 				TxId:      "INVALID TXID!!!",
 				Type:      int32(common.HeaderType_ENDORSER_TRANSACTION),
-				ChannelId: util2.GetTestChainID(),
+				ChannelId: "testchannelid",
 			}),
 			SignatureHeader: protoutil.MarshalOrPanic(&common.SignatureHeader{
 				Nonce:   []byte("nonce"),
@@ -196,10 +209,10 @@ func TestTxValidationFailure_InvalidTxid(t *testing.T) {
 	payloadBytes, err := proto.Marshal(payload)
 
 	// Check marshaling didn't fail
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	sig, err := mockSigner.Sign(payloadBytes)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	// Envelope the payload
 	envelope := &common.Envelope{
@@ -210,7 +223,7 @@ func TestTxValidationFailure_InvalidTxid(t *testing.T) {
 	envelopeBytes, err := proto.Marshal(envelope)
 
 	// Check marshaling didn't fail
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	block := &common.Block{
 		Data: &common.BlockData{
@@ -226,16 +239,16 @@ func TestTxValidationFailure_InvalidTxid(t *testing.T) {
 
 	// Initialize metadata
 	protoutil.InitBlockMetadata(block)
-	txsFilter := util.NewTxValidationFlagsSetValue(len(block.Data.Data), peer.TxValidationCode_VALID)
+	txsFilter := txflags.NewWithValues(len(block.Data.Data), peer.TxValidationCode_VALID)
 	block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER] = txsFilter
 
 	// Validation should invalidate transaction,
 	// because it's already committed
 	tValidator.Validate(block)
 
-	txsfltr := util.TxValidationFlags(block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
-	assert.True(t, txsfltr.IsInvalid(0))
+	txsfltr := txflags.ValidationFlags(block.Metadata.Metadata[common.BlockMetadataIndex_TRANSACTIONS_FILTER])
+	require.True(t, txsfltr.IsInvalid(0))
 
 	// We expect the tx to be invalid because of a bad txid
-	assert.True(t, txsfltr.Flag(0) == peer.TxValidationCode_BAD_PROPOSAL_TXID)
+	require.True(t, txsfltr.Flag(0) == peer.TxValidationCode_BAD_PROPOSAL_TXID)
 }

@@ -7,19 +7,22 @@ SPDX-License-Identifier: Apache-2.0
 package channelconfig
 
 import (
+	"bytes"
 	"fmt"
 	"io/ioutil"
 	"testing"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric-config/protolator"
+	"github.com/hyperledger/fabric-protos-go/common"
+	cb "github.com/hyperledger/fabric-protos-go/common"
+	mspprotos "github.com/hyperledger/fabric-protos-go/msp"
+	ab "github.com/hyperledger/fabric-protos-go/orderer"
+	"github.com/hyperledger/fabric-protos-go/orderer/etcdraft"
+	pb "github.com/hyperledger/fabric-protos-go/peer"
+	"github.com/hyperledger/fabric/bccsp/sw"
 	"github.com/hyperledger/fabric/common/capabilities"
-	cb "github.com/hyperledger/fabric/protos/common"
-	mspprotos "github.com/hyperledger/fabric/protos/msp"
-	ab "github.com/hyperledger/fabric/protos/orderer"
-	"github.com/hyperledger/fabric/protos/orderer/etcdraft"
-	pb "github.com/hyperledger/fabric/protos/peer"
 	"github.com/hyperledger/fabric/protoutil"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -30,9 +33,9 @@ import (
 // low code coverage count, so here they are.
 
 func basicTest(t *testing.T, sv *StandardConfigValue) {
-	assert.NotNil(t, sv)
-	assert.NotEmpty(t, sv.Key())
-	assert.NotNil(t, sv.Value())
+	require.NotNil(t, sv)
+	require.NotEmpty(t, sv.Key())
+	require.NotNil(t, sv.Value())
 }
 
 func TestUtilsBasic(t *testing.T) {
@@ -281,15 +284,33 @@ func createCfgBlockWithUnsupportedCapabilities(t *testing.T) *cb.Block {
 }
 
 func TestValidateCapabilities(t *testing.T) {
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
 
 	// Test config block with valid capabilities requirement
 	cfgBlock := createCfgBlockWithSupportedCapabilities(t)
-	assert.Nil(t, ValidateCapabilities(cfgBlock), "Should return Nil with matched capabilities checking")
+	err = ValidateCapabilities(cfgBlock, cryptoProvider)
+	require.NoError(t, err)
 
 	// Test config block with invalid capabilities requirement
 	cfgBlock = createCfgBlockWithUnsupportedCapabilities(t)
-	assert.NotNil(t, ValidateCapabilities(cfgBlock), "Should return Error with mismatched capabilities checking")
+	err = ValidateCapabilities(cfgBlock, cryptoProvider)
+	require.EqualError(t, err, "Channel capability INCOMPATIBLE_CAPABILITIES is required but not supported")
+}
 
+func TestExtractMSPIDsForApplicationOrgs(t *testing.T) {
+	// load test_configblock.json that contains the application group
+	// and other properties needed to build channel config and extract MSPIDs
+	blockData, err := ioutil.ReadFile("testdata/test_configblock.json")
+	require.NoError(t, err)
+	block := &common.Block{}
+	protolator.DeepUnmarshalJSON(bytes.NewBuffer(blockData), block)
+
+	cryptoProvider, err := sw.NewDefaultSecurityLevelWithKeystore(sw.NewDummyKeyStore())
+	require.NoError(t, err)
+	mspids, err := ExtractMSPIDsForApplicationOrgs(block, cryptoProvider)
+	require.NoError(t, err)
+	require.ElementsMatch(t, mspids, []string{"Org1MSP", "Org2MSP"})
 }
 
 func TestMarshalEtcdRaftMetadata(t *testing.T) {
@@ -317,9 +338,11 @@ func TestMarshalEtcdRaftMetadata(t *testing.T) {
 	}
 	packed, err := MarshalEtcdRaftMetadata(md)
 	require.Nil(t, err, "marshalling should succeed")
+	require.NotNil(t, packed)
 
 	packed, err = MarshalEtcdRaftMetadata(md)
 	require.Nil(t, err, "marshalling should succeed a second time because we did not mutate ourselves")
+	require.NotNil(t, packed)
 
 	unpacked := &etcdraft.ConfigMetadata{}
 	require.Nil(t, proto.Unmarshal(packed, unpacked), "unmarshalling should succeed")

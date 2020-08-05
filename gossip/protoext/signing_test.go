@@ -11,16 +11,17 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/gogo/protobuf/proto"
+	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric-protos-go/gossip"
 	"github.com/hyperledger/fabric/gossip/protoext"
-	"github.com/hyperledger/fabric/protos/gossip"
-	"github.com/stretchr/testify/assert"
+	"github.com/hyperledger/fabric/protoutil"
+	"github.com/stretchr/testify/require"
 )
 
 func TestToGossipMessageNilEnvelope(t *testing.T) {
 	memReq := &gossip.MembershipRequest{}
 	_, err := protoext.EnvelopeToGossipMessage(memReq.SelfInformation)
-	assert.EqualError(t, err, "nil envelope")
+	require.EqualError(t, err, "nil envelope")
 }
 
 func TestToString(t *testing.T) {
@@ -31,7 +32,7 @@ func TestToString(t *testing.T) {
 
 	// The following line proves that the envelopes constructed in this test
 	// have "2" in them when they are printed
-	assert.Contains(t, fmt.Sprintf("%v", envelopes()[0]), "2")
+	require.Contains(t, fmt.Sprintf("%v", envelopes()[0]), "2")
 	// and the following does the same for payloads:
 	dMsg := &gossip.DataMessage{
 		Payload: &gossip.Payload{
@@ -39,7 +40,7 @@ func TestToString(t *testing.T) {
 			Data:   []byte{2, 2, 2, 2, 2},
 		},
 	}
-	assert.Contains(t, fmt.Sprintf("%v", dMsg), "2")
+	require.Contains(t, fmt.Sprintf("%v", dMsg), "2")
 
 	// Now we construct all types of messages that have envelopes or payloads in them
 	// and see that "2" is not outputted into their formatting even though it is found
@@ -68,9 +69,9 @@ func TestToString(t *testing.T) {
 			},
 		},
 	}
-	assert.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
+	require.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
 	sMsg.GetDataMsg().Payload = nil
-	assert.NotPanics(t, func() {
+	require.NotPanics(t, func() {
 		_ = sMsg.String()
 	})
 
@@ -89,7 +90,7 @@ func TestToString(t *testing.T) {
 		},
 		Envelope: envelopes()[0],
 	}
-	assert.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
+	require.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
 
 	sMsg = &protoext.SignedGossipMessage{
 		GossipMessage: &gossip.GossipMessage{
@@ -105,7 +106,7 @@ func TestToString(t *testing.T) {
 		},
 		Envelope: envelopes()[0],
 	}
-	assert.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
+	require.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
 
 	sMsg = &protoext.SignedGossipMessage{
 		GossipMessage: &gossip.GossipMessage{
@@ -120,7 +121,7 @@ func TestToString(t *testing.T) {
 		},
 		Envelope: envelopes()[0],
 	}
-	assert.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
+	require.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
 
 	sMsg = &protoext.SignedGossipMessage{
 		GossipMessage: &gossip.GossipMessage{
@@ -144,7 +145,7 @@ func TestToString(t *testing.T) {
 		},
 		Envelope: envelopes()[0],
 	}
-	assert.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
+	require.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
 
 	sMsg = &protoext.SignedGossipMessage{
 		GossipMessage: &gossip.GossipMessage{
@@ -161,7 +162,7 @@ func TestToString(t *testing.T) {
 		},
 		Envelope: envelopes()[0],
 	}
-	assert.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
+	require.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
 
 	sMsg = &protoext.SignedGossipMessage{
 		GossipMessage: &gossip.GossipMessage{
@@ -177,7 +178,7 @@ func TestToString(t *testing.T) {
 		},
 		Envelope: envelopes()[0],
 	}
-	assert.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
+	require.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
 
 	sMsg = &protoext.SignedGossipMessage{
 		GossipMessage: &gossip.GossipMessage{
@@ -192,7 +193,7 @@ func TestToString(t *testing.T) {
 		},
 		Envelope: envelopes()[0],
 	}
-	assert.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
+	require.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
 
 	sMsg = &protoext.SignedGossipMessage{
 		GossipMessage: &gossip.GossipMessage{
@@ -207,7 +208,7 @@ func TestToString(t *testing.T) {
 		},
 		Envelope: envelopes()[0],
 	}
-	assert.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
+	require.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
 
 	sMsg = &protoext.SignedGossipMessage{
 		GossipMessage: &gossip.GossipMessage{
@@ -224,7 +225,7 @@ func TestToString(t *testing.T) {
 		},
 		Envelope: envelopes()[0],
 	}
-	assert.Contains(t, fmt.Sprintf("%v", sMsg), "2")
+	require.Contains(t, fmt.Sprintf("%v", sMsg), "2")
 
 	sMsg = &protoext.SignedGossipMessage{
 		GossipMessage: &gossip.GossipMessage{
@@ -241,7 +242,7 @@ func TestToString(t *testing.T) {
 		},
 		Envelope: envelopes()[0],
 	}
-	assert.Contains(t, fmt.Sprintf("%v", sMsg), "2")
+	require.Contains(t, fmt.Sprintf("%v", sMsg), "2")
 
 	sMsg = &protoext.SignedGossipMessage{
 		GossipMessage: &gossip.GossipMessage{
@@ -261,7 +262,7 @@ func TestToString(t *testing.T) {
 		},
 		Envelope: envelopes()[0],
 	}
-	assert.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
+	require.NotContains(t, fmt.Sprintf("%v", sMsg), "2")
 }
 
 func TestSignedGossipMessageSign(t *testing.T) {
@@ -285,11 +286,11 @@ func TestSignedGossipMessageSign(t *testing.T) {
 	signedMsg, _ := msg.Sign(idSigner)
 
 	// Since checking the identity signer, signature will be same as the payload
-	assert.Equal(t, signedMsg.Payload, signedMsg.Signature)
+	require.Equal(t, signedMsg.Payload, signedMsg.Signature)
 
 	env, err := msg.Sign(errSigner)
-	assert.Error(t, err)
-	assert.Nil(t, env)
+	require.Error(t, err)
+	require.Nil(t, env)
 }
 
 func TestEnvelope_NoopSign(t *testing.T) {
@@ -304,8 +305,8 @@ func TestEnvelope_NoopSign(t *testing.T) {
 	signedMsg, err := protoext.NoopSign(msg)
 
 	// Since checking the identity signer, signature will be same as the payload
-	assert.Nil(t, signedMsg.Signature)
-	assert.NoError(t, err)
+	require.Nil(t, signedMsg.Signature)
+	require.NoError(t, err)
 }
 
 func TestSignedGossipMessage_Verify(t *testing.T) {
@@ -322,13 +323,13 @@ func TestSignedGossipMessage_Verify(t *testing.T) {
 		},
 		Envelope: envelopes()[0],
 	}
-	assert.True(t, msg.IsSigned())
+	require.True(t, msg.IsSigned())
 
 	verifier := func(peerIdentity []byte, signature, message []byte) error {
 		return nil
 	}
 	res := msg.Verify(peerID, verifier)
-	assert.Nil(t, res)
+	require.Nil(t, res)
 
 	msg = &protoext.SignedGossipMessage{
 		GossipMessage: &gossip.GossipMessage{
@@ -344,19 +345,19 @@ func TestSignedGossipMessage_Verify(t *testing.T) {
 	env := msg.Envelope
 	msg.Envelope = nil
 	res = msg.Verify(peerID, verifier)
-	assert.Error(t, res)
+	require.Error(t, res)
 
 	msg.Envelope = env
 	payload := msg.Envelope.Payload
 	msg.Envelope.Payload = nil
 	res = msg.Verify(peerID, verifier)
-	assert.Error(t, res)
+	require.Error(t, res)
 
 	msg.Envelope.Payload = payload
 	sig := msg.Signature
 	msg.Signature = nil
 	res = msg.Verify(peerID, verifier)
-	assert.Error(t, res)
+	require.Error(t, res)
 	msg.Signature = sig
 
 	errVerifier := func(peerIdentity []byte, signature, message []byte) error {
@@ -364,7 +365,7 @@ func TestSignedGossipMessage_Verify(t *testing.T) {
 	}
 
 	res = msg.Verify(peerID, errVerifier)
-	assert.Error(t, res)
+	require.Error(t, res)
 }
 
 func TestEnvelope(t *testing.T) {
@@ -372,16 +373,16 @@ func TestEnvelope(t *testing.T) {
 		Content: dataMessage(1, []byte("data")),
 	}
 	bytes, err := proto.Marshal(dataMsg)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	env := envelopes()[0]
 	env.Payload = bytes
 
 	msg, err := protoext.EnvelopeToGossipMessage(env)
-	assert.NoError(t, err)
-	assert.NotNil(t, msg)
+	require.NoError(t, err)
+	require.NotNil(t, msg)
 
-	assert.True(t, protoext.IsDataMsg(msg.GossipMessage))
+	require.True(t, protoext.IsDataMsg(msg.GossipMessage))
 }
 
 func TestEnvelope_SignSecret(t *testing.T) {
@@ -389,7 +390,7 @@ func TestEnvelope_SignSecret(t *testing.T) {
 		Content: dataMessage(1, []byte("data")),
 	}
 	bytes, err := proto.Marshal(dataMsg)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	env := envelopes()[0]
 	env.Payload = bytes
@@ -403,8 +404,21 @@ func TestEnvelope_SignSecret(t *testing.T) {
 		},
 	})
 
-	assert.NotNil(t, env.SecretEnvelope)
-	assert.Equal(t, protoext.InternalEndpoint(env.SecretEnvelope), "localhost:5050")
+	require.NotNil(t, env.SecretEnvelope)
+	require.Equal(t, protoext.InternalEndpoint(env.SecretEnvelope), "localhost:5050")
+}
+
+func TestInternalEndpoint(t *testing.T) {
+	require.Empty(t, protoext.InternalEndpoint(nil))
+	require.Empty(t, protoext.InternalEndpoint(&gossip.SecretEnvelope{
+		Payload: []byte{1, 2, 3}}))
+	require.Equal(t, "foo", protoext.InternalEndpoint(&gossip.SecretEnvelope{
+		Payload: protoutil.MarshalOrPanic(
+			&gossip.Secret{
+				Content: &gossip.Secret_InternalEndpoint{
+					InternalEndpoint: "foo",
+				},
+			})}))
 }
 
 func envelopes() []*gossip.Envelope {

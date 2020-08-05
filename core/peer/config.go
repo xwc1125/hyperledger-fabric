@@ -28,11 +28,23 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/hyperledger/fabric/core/comm"
 	"github.com/hyperledger/fabric/core/config"
+	"github.com/hyperledger/fabric/internal/pkg/comm"
 	"github.com/pkg/errors"
 	"github.com/spf13/viper"
 )
+
+// ExternalBuilder represents the configuration structure of
+// a chaincode external builder
+type ExternalBuilder struct {
+	// TODO: Remove Environment in 3.0
+	// Deprecated: Environment is retained for backwards compatibility.
+	// New deployments should use the new PropagateEnvironment field
+	Environment          []string `yaml:"environmentWhitelist"`
+	PropagateEnvironment []string `yaml:"propagateEnvironment"`
+	Name                 string   `yaml:"name"`
+	Path                 string   `yaml:"path"`
+}
 
 // Config is the struct that defines the Peer configurations.
 type Config struct {
@@ -67,7 +79,7 @@ type Config struct {
 
 	// ----- Peer Delivery Client Keepalive -----
 	// DeliveryClient Keepalive settings for communication with ordering nodes.
-	DeliverClientKeepaliveOptions *comm.KeepaliveOptions
+	DeliverClientKeepaliveOptions comm.KeepaliveOptions
 
 	// ----- Profile -----
 	// TODO: create separate sub-struct for Profile config.
@@ -102,9 +114,14 @@ type Config struct {
 	// Limits is used to configure some internal resource limits.
 	// TODO: create separate sub-struct for Limits config.
 
-	// LimitsConcurrencyQSCC sets the limits for number of concurrently running
-	// qscc system chaincode requests.
-	LimitsConcurrencyQSCC int
+	// LimitsConcurrencyEndorserService sets the limits for concurrent requests sent to
+	// endorser service that handles chaincode deployment, query and invocation,
+	// including both user chaincodes and system chaincodes.
+	LimitsConcurrencyEndorserService int
+
+	// LimitsConcurrencyDeliverService sets the limits for concurrent event listeners
+	// registered to deliver service for blocks and transaction events.
+	LimitsConcurrencyDeliverService int
 
 	// ----- TLS -----
 	// Require server-side TLS.
@@ -139,6 +156,10 @@ type Config struct {
 
 	// ChaincodePull enables/disables force pulling of the base docker image.
 	ChaincodePull bool
+	// ExternalBuilders represents the builders and launchers for
+	// chaincode. The external builder detection processing will iterate over the
+	// builders in the order specified below.
+	ExternalBuilders []ExternalBuilder
 
 	// ----- Operations config -----
 	// TODO: create separate sub-struct for Operations config.
@@ -198,11 +219,14 @@ func GlobalConfig() (*Config, error) {
 }
 
 func (c *Config) load() error {
-	preeAddress, err := getLocalAddress()
+	peerAddress, err := getLocalAddress()
 	if err != nil {
 		return err
 	}
-	c.PeerAddress = preeAddress
+
+	configDir := filepath.Dir(viper.ConfigFileUsed())
+
+	c.PeerAddress = peerAddress
 	c.PeerID = viper.GetString("peer.id")
 	c.LocalMSPID = viper.GetString("peer.localMspId")
 	c.ListenAddress = viper.GetString("peer.listenAddress")
@@ -216,7 +240,8 @@ func (c *Config) load() error {
 
 	c.PeerTLSEnabled = viper.GetBool("peer.tls.enabled")
 	c.NetworkID = viper.GetString("peer.networkId")
-	c.LimitsConcurrencyQSCC = viper.GetInt("peer.limits.concurrency.qscc")
+	c.LimitsConcurrencyEndorserService = viper.GetInt("peer.limits.concurrency.endorserService")
+	c.LimitsConcurrencyDeliverService = viper.GetInt("peer.limits.concurrency.deliverService")
 	c.DiscoveryEnabled = viper.GetBool("peer.discovery.enabled")
 	c.ProfileEnabled = viper.GetBool("peer.profile.enabled")
 	c.ProfileListenAddress = viper.GetString("peer.profile.listenAddress")
@@ -250,13 +275,33 @@ func (c *Config) load() error {
 	}
 
 	c.ChaincodePull = viper.GetBool("chaincode.pull")
+	var externalBuilders []ExternalBuilder
+	err = viper.UnmarshalKey("chaincode.externalBuilders", &externalBuilders)
+	if err != nil {
+		return err
+	}
+	c.ExternalBuilders = externalBuilders
+	for builderIndex, builder := range c.ExternalBuilders {
+		if builder.Path == "" {
+			return fmt.Errorf("invalid external builder configuration, path attribute missing in one or more builders")
+		}
+		if builder.Name == "" {
+			return fmt.Errorf("external builder at path %s has no name attribute", builder.Path)
+		}
+		if builder.Environment != nil && builder.PropagateEnvironment == nil {
+			c.ExternalBuilders[builderIndex].PropagateEnvironment = builder.Environment
+		}
+	}
 
 	c.OperationsListenAddress = viper.GetString("operations.listenAddress")
 	c.OperationsTLSEnabled = viper.GetBool("operations.tls.enabled")
-	c.OperationsTLSCertFile = viper.GetString("operations.tls.cert.file")
-	c.OperationsTLSKeyFile = viper.GetString("operations.tls.key.file")
+	c.OperationsTLSCertFile = config.GetPath("operations.tls.cert.file")
+	c.OperationsTLSKeyFile = config.GetPath("operations.tls.key.file")
 	c.OperationsTLSClientAuthRequired = viper.GetBool("operations.tls.clientAuthRequired")
-	c.OperationsTLSClientRootCAs = viper.GetStringSlice("operations.tls.clientRootCAs.files")
+
+	for _, rca := range viper.GetStringSlice("operations.tls.clientRootCAs.files") {
+		c.OperationsTLSClientRootCAs = append(c.OperationsTLSClientRootCAs, config.TranslatePath(configDir, rca))
+	}
 
 	c.MetricsProvider = viper.GetString("metrics.provider")
 	c.StatsdNetwork = viper.GetString("metrics.statsd.network")
@@ -307,11 +352,13 @@ func getLocalAddress() (string, error) {
 
 // GetServerConfig returns the gRPC server configuration for the peer
 func GetServerConfig() (comm.ServerConfig, error) {
-	secureOptions := &comm.SecureOptions{
-		UseTLS: viper.GetBool("peer.tls.enabled"),
+	serverConfig := comm.ServerConfig{
+		ConnectionTimeout: viper.GetDuration("peer.connectiontimeout"),
+		SecOpts: comm.SecureOptions{
+			UseTLS: viper.GetBool("peer.tls.enabled"),
+		},
 	}
-	serverConfig := comm.ServerConfig{SecOpts: secureOptions}
-	if secureOptions.UseTLS {
+	if serverConfig.SecOpts.UseTLS {
 		// get the certs from the file system
 		serverKey, err := ioutil.ReadFile(config.GetPath("peer.tls.key.file"))
 		if err != nil {
@@ -321,10 +368,10 @@ func GetServerConfig() (comm.ServerConfig, error) {
 		if err != nil {
 			return serverConfig, fmt.Errorf("error loading TLS certificate (%s)", err)
 		}
-		secureOptions.Certificate = serverCert
-		secureOptions.Key = serverKey
-		secureOptions.RequireClientCert = viper.GetBool("peer.tls.clientAuthRequired")
-		if secureOptions.RequireClientCert {
+		serverConfig.SecOpts.Certificate = serverCert
+		serverConfig.SecOpts.Key = serverKey
+		serverConfig.SecOpts.RequireClientCert = viper.GetBool("peer.tls.clientAuthRequired")
+		if serverConfig.SecOpts.RequireClientCert {
 			var clientRoots [][]byte
 			for _, file := range viper.GetStringSlice("peer.tls.clientRootCAs.files") {
 				clientRoot, err := ioutil.ReadFile(
@@ -335,7 +382,7 @@ func GetServerConfig() (comm.ServerConfig, error) {
 				}
 				clientRoots = append(clientRoots, clientRoot)
 			}
-			secureOptions.ClientRootCAs = clientRoots
+			serverConfig.SecOpts.ClientRootCAs = clientRoots
 		}
 		// check for root cert
 		if config.GetPath("peer.tls.rootcert.file") != "" {
@@ -343,7 +390,7 @@ func GetServerConfig() (comm.ServerConfig, error) {
 			if err != nil {
 				return serverConfig, fmt.Errorf("error loading TLS root certificate (%s)", err)
 			}
-			secureOptions.ServerRootCAs = [][]byte{rootCert}
+			serverConfig.SecOpts.ServerRootCAs = [][]byte{rootCert}
 		}
 	}
 	// get the default keepalive options

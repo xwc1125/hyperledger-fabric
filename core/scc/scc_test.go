@@ -4,150 +4,41 @@ Copyright IBM Corp. All Rights Reserved.
 SPDX-License-Identifier: Apache-2.0
 */
 
-package scc
+package scc_test
 
 import (
-	"os"
 	"testing"
 
-	"github.com/hyperledger/fabric/core/container/inproccontroller"
-	"github.com/hyperledger/fabric/core/ledger/ledgermgmt"
-	ccprovider2 "github.com/hyperledger/fabric/core/mocks/ccprovider"
-	"github.com/hyperledger/fabric/core/peer"
-	"github.com/spf13/viper"
-	"github.com/stretchr/testify/assert"
+	"github.com/hyperledger/fabric/core/chaincode/lifecycle"
+	"github.com/hyperledger/fabric/core/scc"
+	"github.com/hyperledger/fabric/core/scc/mock"
+	. "github.com/onsi/gomega"
 )
 
-func init() {
-	viper.Set("peer.fileSystemPath", os.TempDir())
-}
-
-func newTestProvider() *Provider {
-	p := &Provider{
-		Peer:      &peer.Peer{},
-		Registrar: inproccontroller.NewRegistry(),
-		Whitelist: map[string]bool{
-			"invokableExternalButNotCC2CC": true,
-			"invokableCC2CCButNotExternal": true,
-			"disabled":                     true,
-		},
-	}
-	for _, cc := range []SelfDescribingSysCC{
-		&SysCCWrapper{
-			SCC: &SystemChaincode{
-				Name:              "invokableExternalButNotCC2CC",
-				InvokableExternal: true,
-				InvokableCC2CC:    false,
-				Enabled:           true,
-			},
-		},
-		&SysCCWrapper{
-			SCC: &SystemChaincode{
-				Name:              "invokableCC2CCButNotExternal",
-				InvokableExternal: false,
-				InvokableCC2CC:    true,
-				Enabled:           true,
-			},
-		},
-		&SysCCWrapper{
-			SCC: &SystemChaincode{
-				Name:    "disabled",
-				Enabled: false,
-			},
-		},
-	} {
-		p.RegisterSysCC(cc)
-	}
-	return p
+//go:generate counterfeiter -o mock/chaincode_stream_handler.go --fake-name ChaincodeStreamHandler . chaincodeStreamHandler
+type chaincodeStreamHandler interface {
+	scc.ChaincodeStreamHandler
 }
 
 func TestDeploy(t *testing.T) {
-	p := newTestProvider()
-	ccp := &ccprovider2.MockCcProviderImpl{}
-	p.DeploySysCCs("", ccp)
-	f := func() {
-		p.DeploySysCCs("a", ccp)
-	}
-	assert.Panics(t, f)
+	gt := NewGomegaWithT(t)
 
-	cleanup := ledgermgmt.InitializeTestEnv(t)
-	defer cleanup()
-	err := peer.CreateMockChannel(p.Peer, "a")
-	if err != nil {
-		t.Fatalf("failed to create mock chain: %v", err)
-	}
-	p.deploySysCC("a", ccp, &SysCCWrapper{SCC: &SystemChaincode{
-		Enabled: true,
-		Name:    "invokableCC2CCButNotExternal",
-	}})
-}
+	doneC := make(chan struct{})
+	csh := &mock.ChaincodeStreamHandler{}
+	csh.LaunchInProcReturns(doneC)
 
-func TestDeDeploySysCC(t *testing.T) {
-	p := newTestProvider()
-	ccp := &ccprovider2.MockCcProviderImpl{}
-	p.DeDeploySysCCs("", ccp)
-	f := func() {
-		p.DeDeploySysCCs("a", ccp)
-	}
-	assert.NotPanics(t, f)
-}
+	deployC := make(chan struct{})
+	go func() { scc.DeploySysCC(&lifecycle.SCC{}, csh); close(deployC) }()
 
-func TestIsSysCC(t *testing.T) {
-	assert.True(t, (newTestProvider()).IsSysCC("invokableExternalButNotCC2CC"))
-	assert.False(t, (newTestProvider()).IsSysCC("noSCC"))
-	assert.True(t, (newTestProvider()).IsSysCC("invokableCC2CCButNotExternal"))
-	assert.True(t, (newTestProvider()).IsSysCC("disabled"))
-}
+	// Consume the register message to enable cleanup
+	gt.Eventually(csh.HandleChaincodeStreamCallCount).Should(Equal(1))
+	stream := csh.HandleChaincodeStreamArgsForCall(0)
+	stream.Recv()
 
-func TestIsSysCCAndNotInvokableCC2CC(t *testing.T) {
-	assert.False(t, (newTestProvider()).IsSysCCAndNotInvokableExternal("invokableExternalButNotCC2CC"))
-	assert.True(t, (newTestProvider()).IsSysCCAndNotInvokableExternal("invokableCC2CCButNotExternal"))
-}
+	close(doneC)
+	gt.Eventually(deployC).Should(BeClosed())
 
-func TestIsSysCCAndNotInvokableExternal(t *testing.T) {
-	assert.False(t, (newTestProvider()).IsSysCCAndNotInvokableCC2CC("invokableCC2CCButNotExternal"))
-	assert.True(t, (newTestProvider()).IsSysCCAndNotInvokableCC2CC("invokableExternalButNotCC2CC"))
-}
-
-func TestSccProviderImpl_GetQueryExecutorForLedger(t *testing.T) {
-	p := &Provider{
-		Peer:      &peer.Peer{},
-		Registrar: inproccontroller.NewRegistry(),
-	}
-	qe, err := p.GetQueryExecutorForLedger("")
-	assert.Nil(t, qe)
-	assert.Error(t, err)
-}
-
-func TestCreatePluginSysCCs(t *testing.T) {
-	assert.NotPanics(t, func() { CreatePluginSysCCs(nil) }, "expected successful init")
-}
-
-func TestRegisterSysCC(t *testing.T) {
-	p := &Provider{
-		Registrar: inproccontroller.NewRegistry(),
-		Whitelist: map[string]bool{
-			"invokableExternalButNotCC2CC": true,
-			"invokableCC2CCButNotExternal": true,
-		},
-	}
-	_, err := p.registerSysCC(&SysCCWrapper{
-		SCC: &SystemChaincode{
-			Name:      "invokableExternalButNotCC2CC",
-			Path:      "path",
-			Enabled:   true,
-			Chaincode: nil,
-		},
-	})
-	assert.NoError(t, err)
-	_, err = p.registerSysCC(&SysCCWrapper{
-		SCC: &SystemChaincode{
-			Name:      "invokableExternalButNotCC2CC",
-			Path:      "path",
-			Enabled:   true,
-			Chaincode: nil,
-		},
-	})
-	assert.Error(t, err)
-	assert.Contains(t, "invokableExternalButNotCC2CC:latest already registered", err)
+	gt.Expect(csh.LaunchInProcCallCount()).To(Equal(1))
+	gt.Expect(csh.LaunchInProcArgsForCall(0)).To(Equal("_lifecycle.syscc"))
+	gt.Eventually(csh.HandleChaincodeStreamCallCount).Should(Equal(1))
 }

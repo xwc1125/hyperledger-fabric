@@ -10,14 +10,14 @@ import (
 	"fmt"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric-protos-go/common"
+	"github.com/hyperledger/fabric-protos-go/ledger/rwset"
+	"github.com/hyperledger/fabric-protos-go/ledger/rwset/kvrwset"
+	"github.com/hyperledger/fabric-protos-go/msp"
+	"github.com/hyperledger/fabric-protos-go/peer"
 	"github.com/hyperledger/fabric/core/ledger"
 	"github.com/hyperledger/fabric/core/ledger/kvledger/txmgmt/rwsetutil"
 	privdatacommon "github.com/hyperledger/fabric/gossip/privdata/common"
-	"github.com/hyperledger/fabric/protos/common"
-	"github.com/hyperledger/fabric/protos/ledger/rwset"
-	"github.com/hyperledger/fabric/protos/ledger/rwset/kvrwset"
-	"github.com/hyperledger/fabric/protos/msp"
-	"github.com/hyperledger/fabric/protos/peer"
 )
 
 type txValidationFlags []uint8
@@ -226,10 +226,10 @@ func sampleCollHashedRwSet(collectionName string, hash []byte, hasWrites bool) *
 	return collHashedRwSet
 }
 
-func extractCollectionConfig(configPackage *common.CollectionConfigPackage, collectionName string) *common.CollectionConfig {
+func extractCollectionConfig(configPackage *peer.CollectionConfigPackage, collectionName string) *peer.CollectionConfig {
 	for _, config := range configPackage.Config {
 		switch cconf := config.Payload.(type) {
-		case *common.CollectionConfig_StaticCollectionConfig:
+		case *peer.CollectionConfig_StaticCollectionConfig:
 			if cconf.StaticCollectionConfig.Name == collectionName {
 				return config
 			}

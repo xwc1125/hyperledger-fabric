@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	proto "github.com/hyperledger/fabric-protos-go/gossip"
 	"github.com/hyperledger/fabric/common/metrics/disabled"
 	"github.com/hyperledger/fabric/gossip/common"
 	"github.com/hyperledger/fabric/gossip/discovery"
@@ -21,8 +22,7 @@ import (
 	"github.com/hyperledger/fabric/gossip/metrics/mocks"
 	"github.com/hyperledger/fabric/gossip/protoext"
 	"github.com/hyperledger/fabric/gossip/util"
-	proto "github.com/hyperledger/fabric/protos/gossip"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func init() {
@@ -341,22 +341,22 @@ func TestReportMetrics(t *testing.T) {
 
 	adapter.ReportMetrics(true)
 
-	assert.Equal(t,
+	require.Equal(t,
 		[]string{"channel", "channel0"},
 		testMetricProvider.FakeDeclarationGauge.WithArgsForCall(0),
 	)
-	assert.EqualValues(t,
+	require.EqualValues(t,
 		1,
 		testMetricProvider.FakeDeclarationGauge.SetArgsForCall(0),
 	)
 
 	adapter.ReportMetrics(false)
 
-	assert.Equal(t,
+	require.Equal(t,
 		[]string{"channel", "channel0"},
 		testMetricProvider.FakeDeclarationGauge.WithArgsForCall(1),
 	)
-	assert.EqualValues(t,
+	require.EqualValues(t,
 		0,
 		testMetricProvider.FakeDeclarationGauge.SetArgsForCall(1),
 	)

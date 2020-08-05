@@ -11,8 +11,8 @@ import (
 	"fmt"
 	"reflect"
 
+	lb "github.com/hyperledger/fabric-protos-go/peer/lifecycle"
 	"github.com/hyperledger/fabric/common/util"
-	lb "github.com/hyperledger/fabric/protos/peer/lifecycle"
 
 	"github.com/golang/protobuf/proto"
 	"github.com/pkg/errors"
@@ -35,6 +35,7 @@ type ReadableState interface {
 
 type OpaqueState interface {
 	GetStateHash(key string) (value []byte, err error)
+	CollectionName() string
 }
 
 type RangeableState interface {
@@ -334,7 +335,7 @@ func (s *Serializer) Deserialize(namespace, name string, metadata *lb.StateMetad
 				fieldValue.SetBytes(oneOf)
 			}
 		case reflect.Ptr:
-			// Note, even non-existant keys will decode to an empty proto
+			// Note, even non-existent keys will decode to an empty proto
 			msg := reflect.New(fieldValue.Type().Elem())
 			err := s.DeserializeFieldAsProto(namespace, name, fieldName, state, msg.Interface().(proto.Message))
 			if err != nil {

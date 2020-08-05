@@ -9,13 +9,13 @@ package protoutil_test
 import (
 	"testing"
 
-	"github.com/hyperledger/fabric/protos/common"
+	"github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric/protoutil"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestNewConfigGroup(t *testing.T) {
-	assert.Equal(t,
+	require.Equal(t,
 		&common.ConfigGroup{
 			Groups:   make(map[string]*common.ConfigGroup),
 			Values:   make(map[string]*common.ConfigValue),

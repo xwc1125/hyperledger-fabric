@@ -14,12 +14,14 @@ const (
 	// _lifecycle resources
 	Lifecycle_InstallChaincode                   = "_lifecycle/InstallChaincode"
 	Lifecycle_QueryInstalledChaincode            = "_lifecycle/QueryInstalledChaincode"
+	Lifecycle_GetInstalledChaincodePackage       = "_lifecycle/GetInstalledChaincodePackage"
 	Lifecycle_QueryInstalledChaincodes           = "_lifecycle/QueryInstalledChaincodes"
 	Lifecycle_ApproveChaincodeDefinitionForMyOrg = "_lifecycle/ApproveChaincodeDefinitionForMyOrg"
+	Lifecycle_QueryApprovedChaincodeDefinition   = "_lifecycle/QueryApprovedChaincodeDefinition"
 	Lifecycle_CommitChaincodeDefinition          = "_lifecycle/CommitChaincodeDefinition"
 	Lifecycle_QueryChaincodeDefinition           = "_lifecycle/QueryChaincodeDefinition"
-	Lifecycle_QueryNamespaceDefinitions          = "_lifecycle/QueryNamespaceDefinitions"
-	Lifecycle_SimulateCommitChaincodeDefinition  = "_lifecycle/SimulateCommitChaincodeDefinition"
+	Lifecycle_QueryChaincodeDefinitions          = "_lifecycle/QueryChaincodeDefinitions"
+	Lifecycle_CheckCommitReadiness               = "_lifecycle/CheckCommitReadiness"
 
 	//Lscc resources
 	Lscc_Install                   = "lscc/Install"
@@ -51,9 +53,4 @@ const (
 	//Events
 	Event_Block         = "event/Block"
 	Event_FilteredBlock = "event/FilteredBlock"
-
-	//Token resources
-	Token_Issue    = "token/Issue"
-	Token_Transfer = "token/Transfer"
-	Token_List     = "token/List"
 )

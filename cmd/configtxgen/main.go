@@ -11,24 +11,23 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/golang/protobuf/proto"
+	"github.com/hyperledger/fabric-config/protolator"
+	"github.com/hyperledger/fabric-config/protolator/protoext/ordererext"
+	cb "github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric/bccsp/factory"
 	"github.com/hyperledger/fabric/common/channelconfig"
 	"github.com/hyperledger/fabric/common/flogging"
-	"github.com/hyperledger/fabric/common/tools/protolator"
-	"github.com/hyperledger/fabric/common/tools/protolator/protoext/ordererext"
 	"github.com/hyperledger/fabric/internal/configtxgen/encoder"
-	genesisconfig "github.com/hyperledger/fabric/internal/configtxgen/localconfig"
+	"github.com/hyperledger/fabric/internal/configtxgen/genesisconfig"
 	"github.com/hyperledger/fabric/internal/configtxgen/metadata"
 	"github.com/hyperledger/fabric/internal/configtxlator/update"
-	cb "github.com/hyperledger/fabric/protos/common"
 	"github.com/hyperledger/fabric/protoutil"
 	"github.com/pkg/errors"
 )
-
-var exitCode = 0
 
 var logger = flogging.MustGetLogger("common.tools.configtxgen")
 
@@ -46,9 +45,9 @@ func doOutputBlock(config *genesisconfig.Profile, channelID string, outputBlock 
 	}
 	genesisBlock := pgen.GenesisBlockForChannel(channelID)
 	logger.Info("Writing genesis block")
-	err = ioutil.WriteFile(outputBlock, protoutil.MarshalOrPanic(genesisBlock), 0644)
+	err = writeFile(outputBlock, protoutil.MarshalOrPanic(genesisBlock), 0640)
 	if err != nil {
-		return fmt.Errorf("Error writing genesis block: %s", err)
+		return fmt.Errorf("error writing genesis block: %s", err)
 	}
 	return nil
 }
@@ -68,9 +67,9 @@ func doOutputChannelCreateTx(conf, baseProfile *genesisconfig.Profile, channelID
 	}
 
 	logger.Info("Writing new channel tx")
-	err = ioutil.WriteFile(outputChannelCreateTx, protoutil.MarshalOrPanic(configtx), 0644)
+	err = writeFile(outputChannelCreateTx, protoutil.MarshalOrPanic(configtx), 0640)
 	if err != nil {
-		return fmt.Errorf("Error writing channel create tx: %s", err)
+		return fmt.Errorf("error writing channel create tx: %s", err)
 	}
 	return nil
 }
@@ -78,11 +77,11 @@ func doOutputChannelCreateTx(conf, baseProfile *genesisconfig.Profile, channelID
 func doOutputAnchorPeersUpdate(conf *genesisconfig.Profile, channelID string, outputAnchorPeersUpdate string, asOrg string) error {
 	logger.Info("Generating anchor peer update")
 	if asOrg == "" {
-		return fmt.Errorf("Must specify an organization to update the anchor peer for")
+		return fmt.Errorf("must specify an organization to update the anchor peer for")
 	}
 
 	if conf.Application == nil {
-		return fmt.Errorf("Cannot update anchor peers without an application section")
+		return fmt.Errorf("cannot update anchor peers without an application section")
 	}
 
 	original, err := encoder.NewChannelGroup(conf)
@@ -115,9 +114,12 @@ func doOutputAnchorPeersUpdate(conf *genesisconfig.Profile, channelID string, ou
 	}
 
 	updateTx, err := protoutil.CreateSignedEnvelope(cb.HeaderType_CONFIG_UPDATE, channelID, nil, newConfigUpdateEnv, 0, 0)
+	if err != nil {
+		return errors.WithMessage(err, "could not create signed envelope")
+	}
 
 	logger.Info("Writing anchor peer update")
-	err = ioutil.WriteFile(outputAnchorPeersUpdate, protoutil.MarshalOrPanic(updateTx), 0644)
+	err = writeFile(outputAnchorPeersUpdate, protoutil.MarshalOrPanic(updateTx), 0640)
 	if err != nil {
 		return fmt.Errorf("Error writing channel anchor peer update: %s", err)
 	}
@@ -128,7 +130,7 @@ func doInspectBlock(inspectBlock string) error {
 	logger.Info("Inspecting block")
 	data, err := ioutil.ReadFile(inspectBlock)
 	if err != nil {
-		return fmt.Errorf("Could not read block %s", inspectBlock)
+		return fmt.Errorf("could not read block %s", inspectBlock)
 	}
 
 	logger.Info("Parsing genesis block")
@@ -181,6 +183,32 @@ func doPrintOrg(t *genesisconfig.TopLevel, printOrg string) error {
 	return errors.Errorf("organization %s not found", printOrg)
 }
 
+func writeFile(filename string, data []byte, perm os.FileMode) error {
+	dirPath := filepath.Dir(filename)
+	exists, err := dirExists(dirPath)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		err = os.MkdirAll(dirPath, 0750)
+		if err != nil {
+			return err
+		}
+	}
+	return ioutil.WriteFile(filename, data, perm)
+}
+
+func dirExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
 func main() {
 	var outputBlock, outputChannelCreateTx, channelCreateTxBaseProfile, profile, configPath, channelID, inspectBlock, inspectChannelCreateTx, outputAnchorPeersUpdate, asOrg, printOrg string
 
@@ -188,11 +216,11 @@ func main() {
 	flag.StringVar(&channelID, "channelID", "", "The channel ID to use in the configtx")
 	flag.StringVar(&outputChannelCreateTx, "outputCreateChannelTx", "", "The path to write a channel creation configtx to (if set)")
 	flag.StringVar(&channelCreateTxBaseProfile, "channelCreateTxBaseProfile", "", "Specifies a profile to consider as the orderer system channel current state to allow modification of non-application parameters during channel create tx generation. Only valid in conjunction with 'outputCreateChannelTx'.")
-	flag.StringVar(&profile, "profile", genesisconfig.SampleInsecureSoloProfile, "The profile from configtx.yaml to use for generation.")
+	flag.StringVar(&profile, "profile", "", "The profile from configtx.yaml to use for generation.")
 	flag.StringVar(&configPath, "configPath", "", "The path containing the configuration to use (if set)")
 	flag.StringVar(&inspectBlock, "inspectBlock", "", "Prints the configuration contained in the block at the specified path")
 	flag.StringVar(&inspectChannelCreateTx, "inspectChannelCreateTx", "", "Prints the configuration contained in the transaction at the specified path")
-	flag.StringVar(&outputAnchorPeersUpdate, "outputAnchorPeersUpdate", "", "Creates an config update to update an anchor peer (works only with the default channel creation, and only for the first update)")
+	flag.StringVar(&outputAnchorPeersUpdate, "outputAnchorPeersUpdate", "", "[DEPRECATED] Creates a config update to update an anchor peer (works only with the default channel creation, and only for the first update)")
 	flag.StringVar(&asOrg, "asOrg", "", "Performs the config generation as a particular organization (by name), only including values in the write set that org (likely) has privilege to set")
 	flag.StringVar(&printOrg, "printOrg", "", "Prints the definition of an organization as JSON. (useful for adding an org to a channel manually)")
 
@@ -207,7 +235,7 @@ func main() {
 	// show version
 	if *version {
 		printVersion()
-		os.Exit(exitCode)
+		os.Exit(0)
 	}
 
 	// don't need to panic when running via command line
@@ -230,20 +258,21 @@ func main() {
 	}()
 
 	logger.Info("Loading configuration")
-	factory.InitFactories(nil)
+	err := factory.InitFactories(nil)
+	if err != nil {
+		logger.Fatalf("Error on initFactories: %s", err)
+	}
 	var profileConfig *genesisconfig.Profile
 	if outputBlock != "" || outputChannelCreateTx != "" || outputAnchorPeersUpdate != "" {
+		if profile == "" {
+			logger.Fatalf("The '-profile' is required when '-outputBlock', '-outputChannelCreateTx', or '-outputAnchorPeersUpdate' is specified")
+		}
+
 		if configPath != "" {
 			profileConfig = genesisconfig.Load(profile, configPath)
 		} else {
 			profileConfig = genesisconfig.Load(profile)
 		}
-	}
-	var topLevelConfig *genesisconfig.TopLevel
-	if configPath != "" {
-		topLevelConfig = genesisconfig.LoadTopLevel(configPath)
-	} else {
-		topLevelConfig = genesisconfig.LoadTopLevel()
 	}
 
 	var baseProfile *genesisconfig.Profile
@@ -289,6 +318,13 @@ func main() {
 	}
 
 	if printOrg != "" {
+		var topLevelConfig *genesisconfig.TopLevel
+		if configPath != "" {
+			topLevelConfig = genesisconfig.LoadTopLevel(configPath)
+		} else {
+			topLevelConfig = genesisconfig.LoadTopLevel()
+		}
+
 		if err := doPrintOrg(topLevelConfig, printOrg); err != nil {
 			logger.Fatalf("Error on printOrg: %s", err)
 		}

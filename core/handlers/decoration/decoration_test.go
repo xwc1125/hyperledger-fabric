@@ -10,8 +10,8 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/hyperledger/fabric/protos/peer"
-	"github.com/stretchr/testify/assert"
+	"github.com/hyperledger/fabric-protos-go/peer"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -28,11 +28,11 @@ func TestApplyDecorations(t *testing.T) {
 
 	finalInput := Apply(nil, initialInput, decorators...)
 	for i := 0; i < iterations; i++ {
-		assert.Equal(t, uint32(i), decorators[i].(*mockDecorator).sequence,
+		require.Equal(t, uint32(i), decorators[i].(*mockDecorator).sequence,
 			"Expected decorators to be applied in the provided sequence")
 	}
 
-	assert.Equal(t, uint32(iterations), binary.BigEndian.Uint32(finalInput.Decorations[decorationKey]),
+	require.Equal(t, uint32(iterations), binary.BigEndian.Uint32(finalInput.Decorations[decorationKey]),
 		"Expected decorators to be applied in the provided sequence")
 }
 
